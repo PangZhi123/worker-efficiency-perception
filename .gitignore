@@ -1,0 +1,24 @@
+# Local Python environments (never commit)
+.venv/
+venv/
+env/
+
+# Python/runtime caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# Models and generated data
+*.pt
+*.onnx
+*.engine
+*.mp4
+outputs/
+data/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
