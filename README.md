@@ -41,6 +41,9 @@ $env:WORK_EFFICIENCY_IMAGE_SIZE = "1280"
 - `GET /files/scenes/{sceneId}`：读取已上传的场景图；
 - `POST /api/work-efficiency/v1/configurations`：提交前端标定点和归一化工作区，生成不可变配置版本。
 - `POST /api/work-efficiency/v1/videos`：上传并登记历史 MP4；
+- `GET /api/work-efficiency/v1/videos/{videoId}`：查询历史视频来源和元数据；
+- `GET /api/work-efficiency/v1/videos/{videoId}/preview`：获取历史视频代表帧；
+- `GET /api/work-efficiency/v1/videos/{videoId}/compatible-configurations`：查询可复用标定配置；
 - `POST /api/work-efficiency/v1/cameras`：登记实时 RTSP/RTMP 地址；
 - `POST /api/work-efficiency/v1/tasks`：创建实时相机或历史视频分析任务；
 - `GET /api/work-efficiency/v1/tasks/{taskId}`：查询任务状态；

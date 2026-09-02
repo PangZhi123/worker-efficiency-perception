@@ -159,6 +159,79 @@ def test_frontend_can_upload_video_and_register_camera(tmp_path):
     assert camera.json()["data"]["status"] == "REGISTERED"
 
 
+def test_video_detail_preview_and_compatible_configurations(tmp_path):
+    source = tmp_path / "source.mp4"
+    writer = cv2.VideoWriter(
+        str(source), cv2.VideoWriter_fourcc(*"mp4v"), 2, (32, 24)
+    )
+    assert writer.isOpened()
+    writer.write(np.zeros((24, 32, 3), dtype=np.uint8))
+    writer.write(np.full((24, 32, 3), 127, dtype=np.uint8))
+    writer.release()
+    client = TestClient(create_app(video_directory=tmp_path / "uploads"))
+
+    with source.open("rb") as video_file:
+        uploaded = client.post(
+            "/api/work-efficiency/v1/videos",
+            files={"file": ("sample.mp4", video_file, "video/mp4")},
+            data={"cameraId": "cam_01"},
+        ).json()["data"]
+
+    scene = upload_scene(client)
+    compatible_payload = configuration_payload(scene["sceneId"])
+    compatible = client.post(
+        "/api/work-efficiency/v1/configurations", json=compatible_payload
+    ).json()["data"]
+    incompatible_payload = configuration_payload(scene["sceneId"])
+    incompatible_payload["cameraId"] = "cam_other"
+    incompatible = client.post(
+        "/api/work-efficiency/v1/configurations", json=incompatible_payload
+    ).json()["data"]
+
+    detail = client.get(f"/api/work-efficiency/v1/videos/{uploaded['videoId']}")
+    assert detail.status_code == 200
+    assert detail.json()["data"]["cameraId"] == "cam_01"
+    assert detail.json()["data"]["previewUrl"].endswith("/preview")
+
+    preview = client.get(
+        f"/api/work-efficiency/v1/videos/{uploaded['videoId']}/preview",
+        params={"timestampSec": 0.5},
+    )
+    assert preview.status_code == 200
+    assert preview.headers["content-type"] == "image/jpeg"
+    decoded = cv2.imdecode(np.frombuffer(preview.content, dtype=np.uint8), cv2.IMREAD_COLOR)
+    assert decoded is not None
+    assert decoded.shape[:2] == (24, 32)
+
+    configurations = client.get(
+        f"/api/work-efficiency/v1/videos/{uploaded['videoId']}/compatible-configurations"
+    )
+    assert configurations.status_code == 200
+    data = configurations.json()["data"]
+    assert data["compatibleCount"] == 1
+    assert data["suggestedAction"] == "SELECT_CONFIGURATION"
+    by_id = {item["configurationId"]: item for item in data["items"]}
+    assert by_id[compatible["configurationId"]]["compatible"] is True
+    assert by_id[incompatible["configurationId"]]["incompatibleReasons"] == [
+        "CAMERA_ID_MISMATCH"
+    ]
+
+    outside_duration = client.get(
+        f"/api/work-efficiency/v1/videos/{uploaded['videoId']}/preview",
+        params={"timestampSec": 99},
+    )
+    assert outside_duration.status_code == 400
+    assert outside_duration.json()["code"] == "WE0101"
+
+
+def test_missing_video_detail_returns_input_unavailable():
+    response = TestClient(create_app()).get(
+        "/api/work-efficiency/v1/videos/video_missing"
+    )
+    assert response.status_code == 404
+    assert response.json()["code"] == "WE0201"
+
+
 def test_configuration_rejects_unknown_scene_and_invalid_area():
     app = create_app()
     client = TestClient(app)
@@ -304,7 +377,19 @@ def test_task_rejects_invalid_input_combinations_and_missing_configuration():
         },
     )
     assert mismatched_camera.status_code == 400
-    assert mismatched_camera.json()["code"] == "WE0202"
+    error = mismatched_camera.json()
+    assert error["code"] == "WE0202"
+    assert error["data"] == {
+        "inputType": "VIDEO_FILE",
+        "sourceId": "video_other",
+        "videoId": "video_other",
+        "videoCameraId": "cam_other",
+        "configurationId": configuration_id,
+        "sourceCameraId": "cam_other",
+        "configurationCameraId": "cam_01",
+        "incompatibleReasons": ["CAMERA_ID_MISMATCH"],
+        "suggestedAction": "RECALIBRATE",
+    }
 
 
 @pytest.mark.parametrize(

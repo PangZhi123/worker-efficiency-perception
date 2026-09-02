@@ -49,11 +49,19 @@ ALLOWED_SCENE_MEDIA_TYPES = {"image/jpeg", "image/png"}
 
 
 class ApiError(Exception):
-    def __init__(self, code: str, message: str, *, status_code: int = 400) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        status_code: int = 400,
+        data: object = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
         self.status_code = status_code
+        self.data = data
 
 
 def create_app(
@@ -99,7 +107,13 @@ def create_app(
     async def handle_api_error(request: Request, error: ApiError) -> JSONResponse:
         return JSONResponse(
             status_code=error.status_code,
-            content=_envelope(request, success=False, code=error.code, message=error.message),
+            content=_envelope(
+                request,
+                success=False,
+                code=error.code,
+                message=error.message,
+                data=error.data,
+            ),
         )
 
     @app.exception_handler(RequestValidationError)
@@ -301,16 +315,72 @@ def create_app(
             status_code=201,
             content=_envelope(
                 request,
-                data={
-                    "videoId": record.video_id,
-                    "cameraId": record.camera_id,
-                    "width": record.width,
-                    "height": record.height,
-                    "fps": record.fps,
-                    "frameCount": record.frame_count,
-                    "durationSec": record.duration_sec,
-                },
+                data=_video_payload(record),
             ),
+        )
+
+    @app.get("/api/work-efficiency/v1/videos/{video_id}", dependencies=[Depends(authorize)])
+    async def get_video(request: Request, video_id: str) -> JSONResponse:
+        video = _require_video(app.state.repository, video_id)
+        return JSONResponse(content=_envelope(request, data=_video_payload(video)))
+
+    @app.get(
+        "/api/work-efficiency/v1/videos/{video_id}/preview",
+        dependencies=[Depends(authorize)],
+    )
+    async def get_video_preview(
+        video_id: str,
+        timestamp_sec: Annotated[float, Query(alias="timestampSec", ge=0)] = 0.0,
+    ) -> Response:
+        video = _require_video(app.state.repository, video_id)
+        if video.duration_sec > 0 and timestamp_sec >= video.duration_sec:
+            raise ApiError(
+                "WE0101",
+                "timestampSec exceeds video duration",
+                data={
+                    "videoId": video.video_id,
+                    "timestampSec": timestamp_sec,
+                    "durationSec": video.duration_sec,
+                },
+            )
+        content = await asyncio.to_thread(_read_video_preview, video, timestamp_sec)
+        return Response(
+            content=content,
+            media_type="image/jpeg",
+            headers={
+                "Cache-Control": "private, max-age=60",
+                "X-Video-ID": video.video_id,
+                "X-Timestamp-Sec": str(timestamp_sec),
+            },
+        )
+
+    @app.get(
+        "/api/work-efficiency/v1/videos/{video_id}/compatible-configurations",
+        dependencies=[Depends(authorize)],
+    )
+    async def get_compatible_configurations(
+        request: Request, video_id: str
+    ) -> JSONResponse:
+        video = _require_video(app.state.repository, video_id)
+        items = [
+            _configuration_compatibility(video, configuration)
+            for configuration in app.state.repository.list_configurations()
+        ]
+        return JSONResponse(
+            content=_envelope(
+                request,
+                data={
+                    "videoId": video.video_id,
+                    "videoCameraId": video.camera_id,
+                    "items": items,
+                    "compatibleCount": sum(item["compatible"] for item in items),
+                    "suggestedAction": (
+                        "SELECT_CONFIGURATION"
+                        if any(item["compatible"] for item in items)
+                        else "RECALIBRATE"
+                    ),
+                },
+            )
         )
 
     @app.post("/api/work-efficiency/v1/cameras", dependencies=[Depends(authorize)])
@@ -551,10 +621,104 @@ def _validate_task_resource(
             raise ApiError("WE0201", f"camera is not registered: {body.camera_id}")
         source_camera_id = camera.camera_id
     if configured_camera_id != source_camera_id:
+        source_id = body.video_id if body.input_type == "VIDEO_FILE" else body.camera_id
+        source_details = (
+            {"videoId": body.video_id, "videoCameraId": source_camera_id}
+            if body.input_type == "VIDEO_FILE"
+            else {"cameraId": body.camera_id}
+        )
         raise ApiError(
             "WE0202",
-            f"configuration is not active for camera: {source_camera_id}",
+            "input source and configuration belong to different camera viewpoints",
+            data={
+                "inputType": body.input_type,
+                "sourceId": source_id,
+                **source_details,
+                "configurationId": configuration.configuration_id,
+                "sourceCameraId": source_camera_id,
+                "configurationCameraId": configured_camera_id,
+                "incompatibleReasons": ["CAMERA_ID_MISMATCH"],
+                "suggestedAction": "RECALIBRATE",
+            },
         )
+
+
+def _require_video(repository: InMemoryRepository, video_id: str) -> VideoRecord:
+    video = repository.get_video(video_id)
+    if video is None:
+        raise ApiError("WE0201", f"video is not registered: {video_id}", status_code=404)
+    return video
+
+
+def _video_payload(video: VideoRecord) -> dict:
+    return {
+        "videoId": video.video_id,
+        "cameraId": video.camera_id,
+        "width": video.width,
+        "height": video.height,
+        "fps": video.fps,
+        "frameCount": video.frame_count,
+        "durationSec": video.duration_sec,
+        "previewUrl": f"/api/work-efficiency/v1/videos/{video.video_id}/preview",
+        "compatibleConfigurationsUrl": (
+            f"/api/work-efficiency/v1/videos/{video.video_id}/compatible-configurations"
+        ),
+    }
+
+
+def _configuration_compatibility(
+    video: VideoRecord, configuration: ConfigurationRecord
+) -> dict:
+    request = configuration.payload.get("request", {})
+    configuration_camera_id = request.get("cameraId")
+    response = configuration.payload.get("response", {})
+    status = response.get("status", "ACTIVE")
+    reasons = []
+    if configuration_camera_id != video.camera_id:
+        reasons.append("CAMERA_ID_MISMATCH")
+    if status != "ACTIVE":
+        reasons.append("CONFIGURATION_NOT_ACTIVE")
+    return {
+        "configurationId": configuration.configuration_id,
+        "cameraId": configuration_camera_id,
+        "sceneId": request.get("sceneId"),
+        "calibrationVersion": configuration.calibration_version,
+        "areaVersion": configuration.area_version,
+        "status": status,
+        "quality": response.get("quality"),
+        "compatible": not reasons,
+        "incompatibleReasons": reasons,
+    }
+
+
+def _read_video_preview(video: VideoRecord, timestamp_sec: float) -> bytes:
+    capture = cv2.VideoCapture(video.path)
+    try:
+        if not capture.isOpened():
+            raise ApiError(
+                "WE0201",
+                "video cannot be opened for preview",
+                status_code=404,
+                data={"videoId": video.video_id},
+            )
+        capture.set(cv2.CAP_PROP_POS_MSEC, timestamp_sec * 1000.0)
+        success, frame = capture.read()
+        if not success or frame is None:
+            raise ApiError(
+                "WE0201",
+                "video frame cannot be decoded for preview",
+                data={"videoId": video.video_id, "timestampSec": timestamp_sec},
+            )
+        encoded, buffer = cv2.imencode(".jpg", frame)
+        if not encoded:
+            raise ApiError(
+                "WE0201",
+                "video preview cannot be encoded",
+                data={"videoId": video.video_id, "timestampSec": timestamp_sec},
+            )
+        return buffer.tobytes()
+    finally:
+        capture.release()
 
 
 def _require_task(repository: InMemoryRepository, task_id: str) -> TaskRecord:

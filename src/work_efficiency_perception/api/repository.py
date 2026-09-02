@@ -114,6 +114,10 @@ class InMemoryRepository:
         with self._lock:
             return self._configurations.get(configuration_id)
 
+    def list_configurations(self) -> tuple[ConfigurationRecord, ...]:
+        with self._lock:
+            return tuple(self._configurations.values())
+
     def add_task(self, task: TaskRecord) -> None:
         with self._lock:
             if task.task_id in self._tasks:
