@@ -125,6 +125,36 @@ class EmptyTracker:
         return ()
 
 
+class RecordingTracker:
+    def __init__(self):
+        self.sequences = []
+
+    def track_frame(self, image, *, frame_seq, timestamp_sec):
+        self.sequences.append(frame_seq)
+        return ()
+
+
+class FakeHistoricalSource:
+    metadata = FrameSourceMetadata("video.mp4", 32, 24, 10, 10, 1, False)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        pass
+
+    def iter_frames(self, stop_event=None):
+        for sequence in range(10):
+            yield VideoFrame(
+                sequence,
+                sequence / 10,
+                np.zeros((24, 32, 3), dtype=np.uint8),
+            )
+
+    def close(self):
+        pass
+
+
 class InsideWorkerTracker:
     def track_frame(self, image, *, frame_seq, timestamp_sec):
         points = (
@@ -145,6 +175,42 @@ class InsideWorkerTracker:
         )
 
 
+def test_historical_video_uses_default_sampling_and_always_analyzes_last_frame():
+    repository = InMemoryRepository()
+    repository.add_video(VideoRecord("video_1", "unused.mp4", "cam_1", 32, 24, 10, 10, 1))
+    configuration = configuration_record()
+    repository.add_configuration(configuration)
+    task = TaskRecord(
+        "task_sampled",
+        "HISTORICAL_VIDEO",
+        None,
+        "video_1",
+        "cfg_1",
+        True,
+        TaskStatus.RUNNING,
+        "created",
+        "updated",
+    )
+    repository.add_task(task)
+    tracker = RecordingTracker()
+    store = AnalysisResultStore()
+    worker = VideoAnalysisWorker(
+        repository,
+        lambda configuration: tracker,
+        store,
+        video_source_factory=lambda path: FakeHistoricalSource(),
+    )
+
+    worker.run(task, configuration, Event())
+
+    assert tracker.sequences == [0, 2, 4, 6, 8, 9]
+    snapshot = store.get(task.task_id)
+    assert snapshot.processed_frames == 10
+    assert snapshot.analyzed_frames == 6
+    assert snapshot.progress == 1
+    assert snapshot.latest_frame.frame_seq == 9
+
+
 def test_video_analysis_worker_updates_progress_and_latest_frame(tmp_path):
     path = tmp_path / "sample.avi"
     make_video(path)
@@ -154,7 +220,7 @@ def test_video_analysis_worker_updates_progress_and_latest_frame(tmp_path):
     repository.add_configuration(configuration)
     task = TaskRecord(
         "task_1",
-        "VIDEO_FILE",
+        "HISTORICAL_VIDEO",
         None,
         "video_1",
         "cfg_1",
@@ -171,6 +237,7 @@ def test_video_analysis_worker_updates_progress_and_latest_frame(tmp_path):
 
     snapshot = store.get(task.task_id)
     assert snapshot.processed_frames == 4
+    assert snapshot.analyzed_frames == 4
     assert snapshot.progress == 1
     assert snapshot.latest_frame is not None
     assert snapshot.latest_frame.timestamp_sec == pytest.approx(1.5)

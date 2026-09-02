@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from math import ceil
 from pathlib import Path
 from threading import Condition, Event, RLock, Thread, current_thread
 from time import monotonic, time
@@ -99,6 +100,16 @@ class VideoFileSource:
         while stop_event is None or not stop_event.is_set():
             success, image = self._capture.read()
             if not success:
+                expected_frames = self.metadata.frame_count or 0
+                tolerance = max(2, ceil(expected_frames * 0.01))
+                if (
+                    (stop_event is None or not stop_event.is_set())
+                    and sequence + tolerance < expected_frames
+                ):
+                    raise ValueError(
+                        "video decoding stopped before the expected end: "
+                        f"decoded {sequence} of {expected_frames} frames"
+                    )
                 break
             reported_msec = float(self._capture.get(cv2.CAP_PROP_POS_MSEC))
             fallback_sec = sequence / self.metadata.fps

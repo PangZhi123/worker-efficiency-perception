@@ -37,15 +37,18 @@ $env:WORK_EFFICIENCY_IMAGE_SIZE = "1280"
 当前已提供：
 
 - `GET /health`：健康检查；
-- `POST /api/work-efficiency/v1/scenes`：上传 PNG/JPEG 场景图并记录尺寸；
+- `POST /api/work-efficiency/v1/scenes`：上传实时分析使用的 PNG/JPEG 场景图；
 - `GET /files/scenes/{sceneId}`：读取已上传的场景图；
-- `POST /api/work-efficiency/v1/configurations`：提交前端标定点和归一化工作区，生成不可变配置版本。
-- `POST /api/work-efficiency/v1/videos`：上传并登记历史 MP4；
-- `GET /api/work-efficiency/v1/videos/{videoId}`：查询历史视频来源和元数据；
-- `GET /api/work-efficiency/v1/videos/{videoId}/preview`：获取历史视频代表帧；
-- `GET /api/work-efficiency/v1/videos/{videoId}/compatible-configurations`：查询可复用标定配置；
+- `POST /api/work-efficiency/v1/configurations`：提交实时相机标定和工作区配置；
+- `POST /api/work-efficiency/v1/historical-analyses`：创建独立历史分析记录；
+- `GET /api/work-efficiency/v1/historical-analyses/{analysisId}`：查询历史分析准备状态；
+- `POST /api/work-efficiency/v1/historical-analyses/{analysisId}/video`：上传专属历史 MP4；
+- `POST /api/work-efficiency/v1/historical-analyses/{analysisId}/scene`：上传专属场景图；
+- `GET /api/work-efficiency/v1/historical-analyses/{analysisId}/video/preview`：获取代表帧；
+- `PUT /api/work-efficiency/v1/historical-analyses/{analysisId}/configuration`：保存历史标定和区域配置；
+- `POST /api/work-efficiency/v1/historical-analyses/{analysisId}/tasks`：启动或重试历史任务；
 - `POST /api/work-efficiency/v1/cameras`：登记实时 RTSP/RTMP 地址；
-- `POST /api/work-efficiency/v1/tasks`：创建实时相机或历史视频分析任务；
+- `POST /api/work-efficiency/v1/tasks`：创建实时相机任务；
 - `GET /api/work-efficiency/v1/tasks/{taskId}`：查询任务状态；
 - `PATCH /api/work-efficiency/v1/tasks/{taskId}`：使用 `{"action":"STOP"}` 幂等停止任务。
 - `GET /api/work-efficiency/v1/tasks/{taskId}/progress`：查询处理进度；
@@ -54,6 +57,8 @@ $env:WORK_EFFICIENCY_IMAGE_SIZE = "1280"
 - `WS /ws/work-efficiency/v1/tasks/{taskId}`：实时推送 `FRAME_RESULT/ERROR`；启用鉴权时可使用 Bearer Header 或 `access_token` 查询参数。
 
 现阶段场景、配置、任务和分析结果使用线程安全的进程内仓储，仅用于开发联调，服务重启后数据会清空。模型文件存在时任务会自动进入后台分析；模型未配置时任务保持 `CREATED`。后续将由数据库仓储替换。
+
+实时分析和历史视频分析使用独立的资源与配置流程。第一版每个历史分析记录包含一个视频、一张专属场景图和一套历史配置；任务启动后输入和配置锁定。历史视频默认按 200 ms 间隔抽帧推理（最高约 5 FPS），并始终分析首帧和末帧；实时流继续采用只保留最新帧的自适应丢帧策略。进度接口中的 `processedFrames` 表示已解码到的原始帧位置，`analyzedFrames` 表示实际执行模型推理的帧数。
 
 MySQL 8 初版表结构位于 `db/mysql_schema.sql`，正式数据库连接参数确认后再实现持久化仓储。
 

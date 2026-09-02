@@ -63,7 +63,7 @@ class TaskOptionsRequest(ApiModel):
 
 
 class TaskCreateRequest(ApiModel):
-    input_type: Literal["CAMERA_STREAM", "VIDEO_FILE"] = Field(alias="inputType")
+    input_type: Literal["CAMERA_STREAM"] = Field(alias="inputType")
     camera_id: Annotated[str | None, Field(min_length=1, max_length=64)] = Field(
         default=None, alias="cameraId"
     )
@@ -78,6 +78,27 @@ class TaskCreateRequest(ApiModel):
 
 class TaskActionRequest(ApiModel):
     action: Literal["STOP"]
+
+
+class HistoricalFeaturePairRequest(ApiModel):
+    video_point: Point = Field(alias="videoPoint")
+    scene_point: Point = Field(alias="scenePoint")
+
+
+class HistoricalConfigurationRequest(ApiModel):
+    calibration_frame_timestamp_sec: Annotated[float, Field(ge=0)] = Field(
+        alias="calibrationFrameTimestampSec"
+    )
+    feature_pairs: Annotated[list[HistoricalFeaturePairRequest], Field(min_length=4)] = Field(
+        alias="featurePairs"
+    )
+    work_areas: Annotated[list[WorkAreaRequest], Field(min_length=1)] = Field(alias="workAreas")
+    algorithm: AlgorithmRequest = Field(default_factory=AlgorithmRequest)
+    storage: StorageRequest = Field(default_factory=StorageRequest)
+
+
+class HistoricalTaskCreateRequest(ApiModel):
+    options: TaskOptionsRequest = Field(default_factory=TaskOptionsRequest)
 
 
 class CameraRegistrationRequest(ApiModel):

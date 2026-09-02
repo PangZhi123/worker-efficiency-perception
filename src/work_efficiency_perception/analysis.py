@@ -13,6 +13,8 @@ from .models import ComplianceInterval, EngineConfig, PoseObservation, WorkArea
 from .tracker import PoseTrackerConfig, YoloPoseByteTrackTracker
 from .video import CameraStreamSource, FrameSource, VideoFileSource
 
+HISTORICAL_VIDEO_SAMPLE_INTERVAL_SEC = 0.2
+
 
 class FrameTracker(Protocol):
     def track_frame(
@@ -35,6 +37,7 @@ class FrameAnalysisResult:
 @dataclass(frozen=True, slots=True)
 class TaskAnalysisSnapshot:
     processed_frames: int = 0
+    analyzed_frames: int = 0
     progress: float | None = None
     latest_frame: FrameAnalysisResult | None = None
     compliance_intervals: dict[str, tuple[ComplianceInterval, ...]] | None = None
@@ -53,8 +56,10 @@ class AnalysisResultStore:
         compliance_intervals: dict[str, tuple[ComplianceInterval, ...]] | None = None,
     ) -> None:
         with self._lock:
+            previous = self._snapshots.get(task_id, TaskAnalysisSnapshot())
             self._snapshots[task_id] = TaskAnalysisSnapshot(
                 processed_frames=frame.frame_seq + 1,
+                analyzed_frames=previous.analyzed_frames + 1,
                 progress=frame.progress,
                 latest_frame=frame,
                 compliance_intervals=compliance_intervals,
@@ -68,6 +73,28 @@ class AnalysisResultStore:
                     except Empty:
                         pass
                     subscriber.put_nowait(frame)
+
+    def complete(self, task_id: str, processed_frames: int) -> None:
+        """Normalize progress after a finite source has been fully consumed."""
+        with self._lock:
+            snapshot = self._snapshots.get(task_id)
+            if snapshot is None:
+                self._snapshots[task_id] = TaskAnalysisSnapshot(
+                    processed_frames=processed_frames,
+                    progress=1.0,
+                )
+                return
+            latest = (
+                None
+                if snapshot.latest_frame is None
+                else replace(snapshot.latest_frame, progress=1.0)
+            )
+            self._snapshots[task_id] = replace(
+                snapshot,
+                processed_frames=processed_frames,
+                progress=1.0,
+                latest_frame=latest,
+            )
 
     def get(self, task_id: str) -> TaskAnalysisSnapshot:
         with self._lock:
@@ -144,45 +171,80 @@ class MediaAnalysisWorker:
         engine = _build_efficiency_engine(configuration)
         with source:
             total_frames = source.metadata.frame_count
+            is_historical = not source.metadata.is_live
+            next_sample_timestamp = 0.0
+            decoded_frames = 0
+            last_decoded_frame = None
+            last_analyzed_sequence = -1
             for frame in source.iter_frames(stop_event):
-                persons = tracker.track_frame(
-                    frame.image,
-                    frame_seq=frame.sequence,
-                    timestamp_sec=frame.timestamp_sec,
-                )
-                work_efficiency = engine.process(persons, frame.timestamp_sec)
-                for person in work_efficiency["persons"]:
-                    point = person["scenePointNorm"]
-                    person["trajectoryDelta"] = (
-                        []
-                        if point is None
-                        else [{"seq": frame.sequence, "x": point["x"], "y": point["y"]}]
+                decoded_frames = frame.sequence + 1
+                last_decoded_frame = frame
+                if is_historical and frame.timestamp_sec + 1e-9 < next_sample_timestamp:
+                    continue
+                self._analyze_frame(task, source, tracker, engine, frame, total_frames)
+                last_analyzed_sequence = frame.sequence
+                if is_historical:
+                    next_sample_timestamp = (
+                        frame.timestamp_sec + HISTORICAL_VIDEO_SAMPLE_INTERVAL_SEC
                     )
-                progress = (
-                    min((frame.sequence + 1) / total_frames, 1.0)
-                    if total_frames
-                    else None
+
+            if (
+                is_historical
+                and not stop_event.is_set()
+                and last_decoded_frame is not None
+                and last_decoded_frame.sequence != last_analyzed_sequence
+            ):
+                self._analyze_frame(
+                    task, source, tracker, engine, last_decoded_frame, total_frames
                 )
-                self._result_store.update(
-                    task.task_id,
-                    FrameAnalysisResult(
-                        frame.sequence,
-                        frame.timestamp_sec,
-                        progress,
-                        persons,
-                        frame.captured_at_sec,
-                        work_efficiency,
-                        source.metadata.width,
-                        source.metadata.height,
-                    ),
-                    {
-                        area.area_id: engine.compliance_intervals(area.area_id)
-                        for area in engine.areas
-                    },
-                )
+            if is_historical and not stop_event.is_set():
+                self._result_store.complete(task.task_id, decoded_frames)
+
+    def _analyze_frame(
+        self,
+        task: TaskRecord,
+        source: FrameSource,
+        tracker: FrameTracker,
+        engine: WorkEfficiencyEngine,
+        frame: object,
+        total_frames: int | None,
+    ) -> None:
+        persons = tracker.track_frame(
+            frame.image,
+            frame_seq=frame.sequence,
+            timestamp_sec=frame.timestamp_sec,
+        )
+        work_efficiency = engine.process(persons, frame.timestamp_sec)
+        for person in work_efficiency["persons"]:
+            point = person["scenePointNorm"]
+            person["trajectoryDelta"] = (
+                []
+                if point is None
+                else [{"seq": frame.sequence, "x": point["x"], "y": point["y"]}]
+            )
+        progress = (
+            min((frame.sequence + 1) / total_frames, 1.0) if total_frames else None
+        )
+        self._result_store.update(
+            task.task_id,
+            FrameAnalysisResult(
+                frame.sequence,
+                frame.timestamp_sec,
+                progress,
+                persons,
+                frame.captured_at_sec,
+                work_efficiency,
+                source.metadata.width,
+                source.metadata.height,
+            ),
+            {
+                area.area_id: engine.compliance_intervals(area.area_id)
+                for area in engine.areas
+            },
+        )
 
     def _resolve_source(self, task: TaskRecord) -> FrameSource:
-        if task.input_type == "VIDEO_FILE" and task.video_id is not None:
+        if task.input_type in {"VIDEO_FILE", "HISTORICAL_VIDEO"} and task.video_id is not None:
             video = self._repository.get_video(task.video_id)
             if video is None:
                 raise FileNotFoundError(f"video is not registered: {task.video_id}")

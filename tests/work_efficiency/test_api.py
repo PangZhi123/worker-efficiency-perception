@@ -107,6 +107,70 @@ def register_video(client: TestClient, video_id: str = "video_01") -> None:
     )
 
 
+def historical_configuration_payload() -> dict:
+    return {
+        "calibrationFrameTimestampSec": 0,
+        "featurePairs": [
+            {"videoPoint": {"x": 0, "y": 0}, "scenePoint": {"x": 0, "y": 0}},
+            {"videoPoint": {"x": 32, "y": 0}, "scenePoint": {"x": 1000, "y": 0}},
+            {"videoPoint": {"x": 32, "y": 24}, "scenePoint": {"x": 1000, "y": 500}},
+            {"videoPoint": {"x": 0, "y": 24}, "scenePoint": {"x": 0, "y": 500}},
+        ],
+        "workAreas": [
+            {
+                "areaId": "zone_01",
+                "coordinateType": "NORMALIZED",
+                "polygon": [
+                    {"x": 0.1, "y": 0.1},
+                    {"x": 0.9, "y": 0.1},
+                    {"x": 0.9, "y": 0.9},
+                    {"x": 0.1, "y": 0.9},
+                ],
+                "expectedWorkerCount": 2,
+                "requiredTeamWorkDurationSec": 3600,
+            }
+        ],
+    }
+
+
+def prepare_historical_analysis(client: TestClient, tmp_path) -> dict:
+    source = tmp_path / "source.mp4"
+    writer = cv2.VideoWriter(
+        str(source), cv2.VideoWriter_fourcc(*"mp4v"), 2, (32, 24)
+    )
+    assert writer.isOpened()
+    writer.write(np.zeros((24, 32, 3), dtype=np.uint8))
+    writer.write(np.full((24, 32, 3), 127, dtype=np.uint8))
+    writer.release()
+    analysis = client.post(
+        "/api/work-efficiency/v1/historical-analyses"
+    ).json()["data"]
+    analysis_id = analysis["analysisId"]
+    with source.open("rb") as video_file:
+        video = client.post(
+            f"/api/work-efficiency/v1/historical-analyses/{analysis_id}/video",
+            files={"file": ("sample.mp4", video_file, "video/mp4")},
+        )
+    assert video.status_code == 201
+    scene = client.post(
+        f"/api/work-efficiency/v1/historical-analyses/{analysis_id}/scene",
+        files={"file": ("scene.png", scene_png(), "image/png")},
+        data={"sceneName": "historical scene"},
+    )
+    assert scene.status_code == 201
+    configuration = client.put(
+        f"/api/work-efficiency/v1/historical-analyses/{analysis_id}/configuration",
+        json=historical_configuration_payload(),
+    )
+    assert configuration.status_code == 200
+    return {
+        "analysisId": analysis_id,
+        "video": video.json()["data"],
+        "scene": scene.json()["data"],
+        "configuration": configuration.json()["data"],
+    }
+
+
 def test_scene_upload_and_configuration_creation():
     app = create_app()
     client = TestClient(app)
@@ -131,70 +195,23 @@ def test_scene_upload_and_configuration_creation():
     assert configuration.payload["homography"][0][0] == pytest.approx(0.005)
 
 
-def test_frontend_can_upload_video_and_register_camera(tmp_path):
-    source = tmp_path / "source.mp4"
-    writer = cv2.VideoWriter(
-        str(source), cv2.VideoWriter_fourcc(*"mp4v"), 2, (32, 24)
-    )
-    assert writer.isOpened()
-    writer.write(np.zeros((24, 32, 3), dtype=np.uint8))
-    writer.write(np.ones((24, 32, 3), dtype=np.uint8))
-    writer.release()
+def test_historical_analysis_has_independent_video_scene_and_configuration(tmp_path):
     client = TestClient(create_app(video_directory=tmp_path / "uploads"))
+    prepared = prepare_historical_analysis(client, tmp_path)
 
-    with source.open("rb") as video_file:
-        uploaded = client.post(
-            "/api/work-efficiency/v1/videos",
-            files={"file": ("sample.mp4", video_file, "video/mp4")},
-            data={"cameraId": "cam_01"},
-        )
-    camera = client.post(
-        "/api/work-efficiency/v1/cameras",
-        json={"cameraId": "cam_01", "streamUrl": "rtsp://camera/live"},
+    detail = client.get(
+        f"/api/work-efficiency/v1/historical-analyses/{prepared['analysisId']}"
     )
-
-    assert uploaded.status_code == 201
-    assert uploaded.json()["data"]["frameCount"] == 2
-    assert camera.status_code == 201
-    assert camera.json()["data"]["status"] == "REGISTERED"
-
-
-def test_video_detail_preview_and_compatible_configurations(tmp_path):
-    source = tmp_path / "source.mp4"
-    writer = cv2.VideoWriter(
-        str(source), cv2.VideoWriter_fourcc(*"mp4v"), 2, (32, 24)
-    )
-    assert writer.isOpened()
-    writer.write(np.zeros((24, 32, 3), dtype=np.uint8))
-    writer.write(np.full((24, 32, 3), 127, dtype=np.uint8))
-    writer.release()
-    client = TestClient(create_app(video_directory=tmp_path / "uploads"))
-
-    with source.open("rb") as video_file:
-        uploaded = client.post(
-            "/api/work-efficiency/v1/videos",
-            files={"file": ("sample.mp4", video_file, "video/mp4")},
-            data={"cameraId": "cam_01"},
-        ).json()["data"]
-
-    scene = upload_scene(client)
-    compatible_payload = configuration_payload(scene["sceneId"])
-    compatible = client.post(
-        "/api/work-efficiency/v1/configurations", json=compatible_payload
-    ).json()["data"]
-    incompatible_payload = configuration_payload(scene["sceneId"])
-    incompatible_payload["cameraId"] = "cam_other"
-    incompatible = client.post(
-        "/api/work-efficiency/v1/configurations", json=incompatible_payload
-    ).json()["data"]
-
-    detail = client.get(f"/api/work-efficiency/v1/videos/{uploaded['videoId']}")
     assert detail.status_code == 200
-    assert detail.json()["data"]["cameraId"] == "cam_01"
-    assert detail.json()["data"]["previewUrl"].endswith("/preview")
+    data = detail.json()["data"]
+    assert data["preparationStatus"] == "READY"
+    assert data["video"]["videoId"] == prepared["video"]["videoId"]
+    assert "cameraId" not in data["video"]
+    assert data["scene"]["sceneId"] == prepared["scene"]["sceneId"]
+    assert data["configuration"]["historicalConfigurationId"].startswith("hist_cfg_")
 
     preview = client.get(
-        f"/api/work-efficiency/v1/videos/{uploaded['videoId']}/preview",
+        f"/api/work-efficiency/v1/historical-analyses/{prepared['analysisId']}/video/preview",
         params={"timestampSec": 0.5},
     )
     assert preview.status_code == 200
@@ -203,30 +220,92 @@ def test_video_detail_preview_and_compatible_configurations(tmp_path):
     assert decoded is not None
     assert decoded.shape[:2] == (24, 32)
 
-    configurations = client.get(
-        f"/api/work-efficiency/v1/videos/{uploaded['videoId']}/compatible-configurations"
+    scene_file = client.get(prepared["scene"]["imageUrl"])
+    assert scene_file.status_code == 200
+    assert scene_file.headers["content-type"] == "image/png"
+
+
+def test_historical_analysis_enforces_order_and_locks_inputs(tmp_path):
+    client = TestClient(create_app(video_directory=tmp_path / "uploads"))
+    analysis_id = client.post(
+        "/api/work-efficiency/v1/historical-analyses"
+    ).json()["data"]["analysisId"]
+    scene_before_video = client.post(
+        f"/api/work-efficiency/v1/historical-analyses/{analysis_id}/scene",
+        files={"file": ("scene.png", scene_png(), "image/png")},
+        data={"sceneName": "scene"},
     )
-    assert configurations.status_code == 200
-    data = configurations.json()["data"]
-    assert data["compatibleCount"] == 1
-    assert data["suggestedAction"] == "SELECT_CONFIGURATION"
-    by_id = {item["configurationId"]: item for item in data["items"]}
-    assert by_id[compatible["configurationId"]]["compatible"] is True
-    assert by_id[incompatible["configurationId"]]["incompatibleReasons"] == [
-        "CAMERA_ID_MISMATCH"
-    ]
+    assert scene_before_video.status_code == 400
+    assert scene_before_video.json()["code"] == "WE0202"
 
-    outside_duration = client.get(
-        f"/api/work-efficiency/v1/videos/{uploaded['videoId']}/preview",
-        params={"timestampSec": 99},
+    prepared = prepare_historical_analysis(client, tmp_path)
+    task = client.post(
+        f"/api/work-efficiency/v1/historical-analyses/{prepared['analysisId']}/tasks",
+        json={},
     )
-    assert outside_duration.status_code == 400
-    assert outside_duration.json()["code"] == "WE0101"
+    assert task.status_code == 201
+    assert task.json()["data"]["inputType"] == "HISTORICAL_VIDEO"
+    assert task.json()["data"]["analysisId"] == prepared["analysisId"]
+
+    locked = client.put(
+        f"/api/work-efficiency/v1/historical-analyses/{prepared['analysisId']}/configuration",
+        json=historical_configuration_payload(),
+    )
+    assert locked.status_code == 409
+    assert locked.json()["data"]["suggestedAction"] == "CREATE_NEW_HISTORICAL_ANALYSIS"
 
 
-def test_missing_video_detail_returns_input_unavailable():
+def test_realtime_and_historical_configurations_cannot_be_cross_used(tmp_path):
+    client = TestClient(create_app(video_directory=tmp_path / "uploads"))
+    prepared = prepare_historical_analysis(client, tmp_path)
+    register_camera(client)
+
+    response = client.post(
+        "/api/work-efficiency/v1/tasks",
+        json={
+            "inputType": "CAMERA_STREAM",
+            "cameraId": "cam_01",
+            "configurationId": prepared["configuration"]["historicalConfigurationId"],
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["code"] == "WE0202"
+
+
+def test_failed_historical_task_can_retry_but_completed_task_cannot(tmp_path):
+    with TestClient(
+        create_app(analysis_worker=FailingWorker(), video_directory=tmp_path / "uploads")
+    ) as client:
+        prepared = prepare_historical_analysis(client, tmp_path)
+        url = (
+            f"/api/work-efficiency/v1/historical-analyses/"
+            f"{prepared['analysisId']}/tasks"
+        )
+        first = client.post(url)
+        wait_for_status(client, first.json()["data"]["taskId"], "FAILED")
+        retry = client.post(url)
+        assert retry.status_code == 201
+        assert retry.json()["data"]["taskId"] != first.json()["data"]["taskId"]
+
+    with TestClient(
+        create_app(analysis_worker=CompletingWorker(), video_directory=tmp_path / "uploads2")
+    ) as client:
+        prepared = prepare_historical_analysis(client, tmp_path)
+        url = (
+            f"/api/work-efficiency/v1/historical-analyses/"
+            f"{prepared['analysisId']}/tasks"
+        )
+        completed = client.post(url)
+        wait_for_status(client, completed.json()["data"]["taskId"], "COMPLETED")
+        duplicate = client.post(url)
+        assert duplicate.status_code == 409
+        assert duplicate.json()["code"] == "WE0202"
+
+
+def test_missing_historical_analysis_returns_input_unavailable():
     response = TestClient(create_app()).get(
-        "/api/work-efficiency/v1/videos/video_missing"
+        "/api/work-efficiency/v1/historical-analyses/hist_missing"
     )
     assert response.status_code == 404
     assert response.json()["code"] == "WE0201"
@@ -351,8 +430,8 @@ def test_task_rejects_invalid_input_combinations_and_missing_configuration():
     missing_configuration = client.post(
         "/api/work-efficiency/v1/tasks",
         json={
-            "inputType": "VIDEO_FILE",
-            "videoId": "video_01",
+            "inputType": "CAMERA_STREAM",
+            "cameraId": "cam_01",
             "configurationId": "cfg_missing",
         },
     )
@@ -365,48 +444,31 @@ def test_task_rejects_invalid_input_combinations_and_missing_configuration():
     assert missing_task.status_code == 404
     assert missing_task.json()["code"] == "WE0201"
 
-    client.app.state.repository.add_video(
-        VideoRecord("video_other", "unused.mp4", "cam_other", 32, 24, 25, 100, 4)
-    )
-    mismatched_camera = client.post(
+    legacy_video_task = client.post(
         "/api/work-efficiency/v1/tasks",
         json={
             "inputType": "VIDEO_FILE",
-            "videoId": "video_other",
+            "videoId": "video_01",
             "configurationId": configuration_id,
         },
     )
-    assert mismatched_camera.status_code == 400
-    error = mismatched_camera.json()
-    assert error["code"] == "WE0202"
-    assert error["data"] == {
-        "inputType": "VIDEO_FILE",
-        "sourceId": "video_other",
-        "videoId": "video_other",
-        "videoCameraId": "cam_other",
-        "configurationId": configuration_id,
-        "sourceCameraId": "cam_other",
-        "configurationCameraId": "cam_01",
-        "incompatibleReasons": ["CAMERA_ID_MISMATCH"],
-        "suggestedAction": "RECALIBRATE",
-    }
+    assert legacy_video_task.status_code == 422
 
 
 @pytest.mark.parametrize(
     ("worker", "status", "failure_code"),
     [(CompletingWorker(), "COMPLETED", None), (FailingWorker(), "FAILED", "WE0301")],
 )
-def test_task_manager_records_completion_and_failure(worker, status, failure_code):
-    with TestClient(create_app(analysis_worker=worker)) as client:
-        configuration_id = create_configuration(client)
-        register_video(client)
+def test_task_manager_records_completion_and_failure(
+    worker, status, failure_code, tmp_path
+):
+    with TestClient(
+        create_app(analysis_worker=worker, video_directory=tmp_path / "uploads")
+    ) as client:
+        prepared = prepare_historical_analysis(client, tmp_path)
         created = client.post(
-            "/api/work-efficiency/v1/tasks",
-            json={
-                "inputType": "VIDEO_FILE",
-                "videoId": "video_01",
-                "configurationId": configuration_id,
-            },
+            f"/api/work-efficiency/v1/historical-analyses/{prepared['analysisId']}/tasks",
+            json={},
         ).json()["data"]
 
         final = wait_for_status(client, created["taskId"], status)
@@ -439,19 +501,16 @@ def test_task_manager_cooperatively_stops_running_worker():
         wait_for_status(client, created["taskId"], "STOPPED")
 
 
-def test_frontend_can_query_progress_latest_result_and_team_efficiency():
+def test_frontend_can_query_progress_latest_result_and_team_efficiency(tmp_path):
     store = AnalysisResultStore()
-    app = create_app(analysis_result_store=store)
+    app = create_app(
+        analysis_result_store=store, video_directory=tmp_path / "uploads"
+    )
     client = TestClient(app)
-    configuration_id = create_configuration(client)
-    register_video(client)
+    prepared = prepare_historical_analysis(client, tmp_path)
     task = client.post(
-        "/api/work-efficiency/v1/tasks",
-        json={
-            "inputType": "VIDEO_FILE",
-            "videoId": "video_01",
-            "configurationId": configuration_id,
-        },
+        f"/api/work-efficiency/v1/historical-analyses/{prepared['analysisId']}/tasks",
+        json={},
     ).json()["data"]
     work_efficiency = {
         "persons": [
@@ -483,6 +542,7 @@ def test_frontend_can_query_progress_latest_result_and_team_efficiency():
     progress = client.get(f"/api/work-efficiency/v1/tasks/{task['taskId']}/progress")
     assert progress.json()["data"]["progress"] == 0.5
     assert progress.json()["data"]["processedFrames"] == 6
+    assert progress.json()["data"]["analyzedFrames"] == 1
 
     latest = client.get(f"/api/work-efficiency/v1/tasks/{task['taskId']}/latest-result")
     assert latest.json()["data"]["persons"][0]["workState"] == "WORKING"
@@ -513,19 +573,16 @@ def test_frontend_can_query_progress_latest_result_and_team_efficiency():
     assert missing_filter.json()["code"] == "WE0101"
 
 
-def test_websocket_pushes_documented_frame_result():
+def test_websocket_pushes_documented_frame_result(tmp_path):
     store = AnalysisResultStore()
-    app = create_app(analysis_result_store=store)
+    app = create_app(
+        analysis_result_store=store, video_directory=tmp_path / "uploads"
+    )
     client = TestClient(app)
-    configuration_id = create_configuration(client)
-    register_video(client)
+    prepared = prepare_historical_analysis(client, tmp_path)
     task_id = client.post(
-        "/api/work-efficiency/v1/tasks",
-        json={
-            "inputType": "VIDEO_FILE",
-            "videoId": "video_01",
-            "configurationId": configuration_id,
-        },
+        f"/api/work-efficiency/v1/historical-analyses/{prepared['analysisId']}/tasks",
+        json={},
     ).json()["data"]["taskId"]
     result = {
         "persons": [

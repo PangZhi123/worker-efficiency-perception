@@ -30,6 +30,8 @@ from .repository import (
     TERMINAL_TASK_STATUSES,
     CameraRecord,
     ConfigurationRecord,
+    HistoricalAnalysisRecord,
+    HistoricalPreparationStatus,
     InMemoryRepository,
     SceneRecord,
     TaskRecord,
@@ -40,6 +42,8 @@ from .runtime import AnalysisWorker, TaskManager
 from .schemas import (
     CameraRegistrationRequest,
     ConfigurationRequest,
+    HistoricalConfigurationRequest,
+    HistoricalTaskCreateRequest,
     TaskActionRequest,
     TaskCreateRequest,
 )
@@ -192,7 +196,7 @@ def create_app(
     @app.get("/files/scenes/{scene_id}", dependencies=[Depends(authorize)])
     async def get_scene_file(scene_id: str) -> Response:
         scene = app.state.repository.get_scene(scene_id)
-        if scene is None:
+        if scene is None or scene.analysis_id is not None:
             raise ApiError("WE0101", f"unknown sceneId: {scene_id}", status_code=404)
         return Response(content=scene.content, media_type=scene.media_type)
 
@@ -201,7 +205,7 @@ def create_app(
         request: Request, body: ConfigurationRequest
     ) -> JSONResponse:
         scene = app.state.repository.get_scene(body.scene_id)
-        if scene is None:
+        if scene is None or scene.analysis_id is not None:
             raise ApiError("WE0101", f"unknown sceneId: {body.scene_id}")
         try:
             areas = tuple(
@@ -277,16 +281,50 @@ def create_app(
         )
         return JSONResponse(status_code=201, content=_envelope(request, data=data))
 
-    @app.post("/api/work-efficiency/v1/videos", dependencies=[Depends(authorize)])
-    async def upload_video(
+    @app.post(
+        "/api/work-efficiency/v1/historical-analyses",
+        dependencies=[Depends(authorize)],
+    )
+    async def create_historical_analysis(request: Request) -> JSONResponse:
+        now = _timestamp()
+        analysis = HistoricalAnalysisRecord(
+            analysis_id=_new_id("hist"),
+            preparation_status=HistoricalPreparationStatus.EMPTY,
+            created_at=now,
+            updated_at=now,
+        )
+        app.state.repository.add_historical_analysis(analysis)
+        return JSONResponse(
+            status_code=201,
+            content=_envelope(request, data=_historical_analysis_payload(app, analysis)),
+        )
+
+    @app.get(
+        "/api/work-efficiency/v1/historical-analyses/{analysis_id}",
+        dependencies=[Depends(authorize)],
+    )
+    async def get_historical_analysis(request: Request, analysis_id: str) -> JSONResponse:
+        analysis = _require_historical_analysis(app.state.repository, analysis_id)
+        return JSONResponse(
+            content=_envelope(request, data=_historical_analysis_payload(app, analysis))
+        )
+
+    @app.post(
+        "/api/work-efficiency/v1/historical-analyses/{analysis_id}/video",
+        dependencies=[Depends(authorize)],
+    )
+    async def upload_historical_video(
         request: Request,
+        analysis_id: str,
         file: Annotated[UploadFile, File()],
-        camera_id: Annotated[str, Form(alias="cameraId", min_length=1, max_length=64)],
     ) -> JSONResponse:
+        analysis = _require_editable_historical_analysis(
+            app.state.repository, analysis_id
+        )
         if file.content_type not in {"video/mp4", "application/octet-stream"}:
             raise ApiError("WE0101", "historical video must be an MP4 file")
         video_id = _new_id("video")
-        directory: Path = app.state.video_directory
+        directory: Path = app.state.video_directory / analysis_id
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / f"{video_id}.mp4"
         try:
@@ -297,90 +335,261 @@ def create_app(
 
             with VideoFileSource(path) as source:
                 metadata = source.metadata
-            record = VideoRecord(
-                video_id,
-                str(path),
-                camera_id,
-                metadata.width,
-                metadata.height,
-                metadata.fps,
-                metadata.frame_count or 0,
-                metadata.duration_sec or 0.0,
+            video = VideoRecord(
+                video_id=video_id,
+                path=str(path),
+                camera_id=None,
+                width=metadata.width,
+                height=metadata.height,
+                fps=metadata.fps,
+                frame_count=metadata.frame_count or 0,
+                duration_sec=metadata.duration_sec or 0.0,
+                analysis_id=analysis_id,
             )
-            app.state.repository.add_video(record)
+            app.state.repository.add_video(video)
         except (OSError, ValueError) as error:
             path.unlink(missing_ok=True)
             raise ApiError("WE0201", f"video cannot be registered: {error}") from error
+        _discard_historical_configuration(app.state.repository, analysis)
+        status = (
+            HistoricalPreparationStatus.ASSETS_READY
+            if analysis.scene_id is not None
+            else HistoricalPreparationStatus.VIDEO_UPLOADED
+        )
+        updated = app.state.repository.update_historical_analysis(
+            analysis_id,
+            expected={analysis.preparation_status},
+            updated_at=_timestamp(),
+            video_id=video.video_id,
+            configuration_id=None,
+            preparation_status=status,
+        )
+        if updated is None:
+            path.unlink(missing_ok=True)
+            app.state.repository.remove_video(video.video_id)
+            raise ApiError("WE0202", "historical analysis changed during upload")
+        _remove_replaced_video(app, analysis.video_id)
         return JSONResponse(
             status_code=201,
-            content=_envelope(
-                request,
-                data=_video_payload(record),
-            ),
+            content=_envelope(request, data=_historical_video_payload(video)),
         )
 
-    @app.get("/api/work-efficiency/v1/videos/{video_id}", dependencies=[Depends(authorize)])
-    async def get_video(request: Request, video_id: str) -> JSONResponse:
-        video = _require_video(app.state.repository, video_id)
-        return JSONResponse(content=_envelope(request, data=_video_payload(video)))
-
-    @app.get(
-        "/api/work-efficiency/v1/videos/{video_id}/preview",
+    @app.post(
+        "/api/work-efficiency/v1/historical-analyses/{analysis_id}/scene",
         dependencies=[Depends(authorize)],
     )
-    async def get_video_preview(
-        video_id: str,
+    async def upload_historical_scene(
+        request: Request,
+        analysis_id: str,
+        file: Annotated[UploadFile, File()],
+        scene_name: Annotated[str, Form(alias="sceneName", min_length=1, max_length=128)],
+    ) -> JSONResponse:
+        analysis = _require_editable_historical_analysis(
+            app.state.repository, analysis_id
+        )
+        if analysis.video_id is None:
+            raise ApiError("WE0202", "historical video must be uploaded before scene")
+        content, width, height = await _decode_scene_upload(file)
+        scene = SceneRecord(
+            scene_id=_new_id("hist_scene"),
+            scene_name=scene_name,
+            site_id=analysis_id,
+            image_url=f"/files/historical-scenes/{analysis_id}",
+            width=width,
+            height=height,
+            media_type=file.content_type or "image/png",
+            content=content,
+            analysis_id=analysis_id,
+        )
+        app.state.repository.add_scene(scene)
+        _discard_historical_configuration(app.state.repository, analysis)
+        updated = app.state.repository.update_historical_analysis(
+            analysis_id,
+            expected={analysis.preparation_status},
+            updated_at=_timestamp(),
+            scene_id=scene.scene_id,
+            configuration_id=None,
+            preparation_status=HistoricalPreparationStatus.ASSETS_READY,
+        )
+        if updated is None:
+            app.state.repository.remove_scene(scene.scene_id)
+            raise ApiError("WE0202", "historical analysis changed during upload")
+        if analysis.scene_id is not None:
+            app.state.repository.remove_scene(analysis.scene_id)
+        return JSONResponse(
+            status_code=201,
+            content=_envelope(request, data=_historical_scene_payload(scene)),
+        )
+
+    @app.get(
+        "/files/historical-scenes/{analysis_id}",
+        dependencies=[Depends(authorize)],
+    )
+    async def get_historical_scene_file(analysis_id: str) -> Response:
+        analysis = _require_historical_analysis(app.state.repository, analysis_id)
+        scene = (
+            app.state.repository.get_scene(analysis.scene_id)
+            if analysis.scene_id is not None
+            else None
+        )
+        if scene is None:
+            raise ApiError("WE0201", "historical scene is not uploaded", status_code=404)
+        return Response(content=scene.content, media_type=scene.media_type)
+
+    @app.get(
+        "/api/work-efficiency/v1/historical-analyses/{analysis_id}/video/preview",
+        dependencies=[Depends(authorize)],
+    )
+    async def get_historical_video_preview(
+        analysis_id: str,
         timestamp_sec: Annotated[float, Query(alias="timestampSec", ge=0)] = 0.0,
     ) -> Response:
-        video = _require_video(app.state.repository, video_id)
+        analysis = _require_historical_analysis(app.state.repository, analysis_id)
+        video = _historical_video(app.state.repository, analysis)
         if video.duration_sec > 0 and timestamp_sec >= video.duration_sec:
             raise ApiError(
                 "WE0101",
                 "timestampSec exceeds video duration",
-                data={
-                    "videoId": video.video_id,
-                    "timestampSec": timestamp_sec,
-                    "durationSec": video.duration_sec,
-                },
+                data={"timestampSec": timestamp_sec, "durationSec": video.duration_sec},
             )
         content = await asyncio.to_thread(_read_video_preview, video, timestamp_sec)
-        return Response(
-            content=content,
-            media_type="image/jpeg",
-            headers={
-                "Cache-Control": "private, max-age=60",
-                "X-Video-ID": video.video_id,
-                "X-Timestamp-Sec": str(timestamp_sec),
-            },
-        )
+        return Response(content=content, media_type="image/jpeg")
 
-    @app.get(
-        "/api/work-efficiency/v1/videos/{video_id}/compatible-configurations",
+    @app.put(
+        "/api/work-efficiency/v1/historical-analyses/{analysis_id}/configuration",
         dependencies=[Depends(authorize)],
     )
-    async def get_compatible_configurations(
-        request: Request, video_id: str
+    async def put_historical_configuration(
+        request: Request,
+        analysis_id: str,
+        body: HistoricalConfigurationRequest,
     ) -> JSONResponse:
-        video = _require_video(app.state.repository, video_id)
-        items = [
-            _configuration_compatibility(video, configuration)
-            for configuration in app.state.repository.list_configurations()
-        ]
-        return JSONResponse(
-            content=_envelope(
-                request,
-                data={
-                    "videoId": video.video_id,
-                    "videoCameraId": video.camera_id,
-                    "items": items,
-                    "compatibleCount": sum(item["compatible"] for item in items),
-                    "suggestedAction": (
-                        "SELECT_CONFIGURATION"
-                        if any(item["compatible"] for item in items)
-                        else "RECALIBRATE"
-                    ),
-                },
+        analysis = _require_editable_historical_analysis(
+            app.state.repository, analysis_id
+        )
+        if analysis.video_id is None or analysis.scene_id is None:
+            raise ApiError(
+                "WE0202",
+                "historical video and scene are required",
+                data={"missingResources": _missing_historical_resources(analysis)},
             )
+        video = _historical_video(app.state.repository, analysis)
+        scene = app.state.repository.get_scene(analysis.scene_id)
+        if scene is None:
+            raise ApiError("WE0201", "historical scene is unavailable")
+        if (
+            video.duration_sec > 0
+            and body.calibration_frame_timestamp_sec >= video.duration_sec
+        ):
+            raise ApiError("WE0101", "calibrationFrameTimestampSec exceeds video duration")
+        _, calibration = _calculate_historical_configuration(
+            body, video, scene, max_mean_reprojection_error_px
+        )
+        configuration_id = analysis.configuration_id or _new_id("hist_cfg")
+        calibration_version = _new_id("cal")
+        area_version = _new_id("area")
+        data = {
+            "historicalConfigurationId": configuration_id,
+            "calibrationVersion": calibration_version,
+            "areaVersion": area_version,
+            "quality": {
+                "meanErrorPx": calibration.mean_error_px,
+                "maxErrorPx": calibration.max_error_px,
+            },
+            "preparationStatus": HistoricalPreparationStatus.READY.value,
+        }
+        payload = body.model_dump(by_alias=True)
+        payload["sceneId"] = scene.scene_id
+        payload["videoId"] = video.video_id
+        app.state.repository.add_historical_configuration(
+            ConfigurationRecord(
+                configuration_id,
+                calibration_version,
+                area_version,
+                {"request": payload, "homography": calibration.homography, "response": data},
+                configuration_type="HISTORICAL",
+                analysis_id=analysis_id,
+            )
+        )
+        updated = app.state.repository.update_historical_analysis(
+            analysis_id,
+            expected={analysis.preparation_status},
+            updated_at=_timestamp(),
+            configuration_id=configuration_id,
+            preparation_status=HistoricalPreparationStatus.READY,
+        )
+        if updated is None:
+            app.state.repository.remove_historical_configuration(configuration_id)
+            raise ApiError("WE0202", "historical analysis changed during configuration")
+        return JSONResponse(content=_envelope(request, data=data))
+
+    @app.post(
+        "/api/work-efficiency/v1/historical-analyses/{analysis_id}/tasks",
+        dependencies=[Depends(authorize)],
+    )
+    async def create_historical_task(
+        request: Request,
+        analysis_id: str,
+        body: HistoricalTaskCreateRequest | None = None,
+    ) -> JSONResponse:
+        analysis = _require_historical_analysis(app.state.repository, analysis_id)
+        missing = _missing_historical_resources(analysis)
+        video = (
+            app.state.repository.get_video(analysis.video_id)
+            if analysis.video_id is not None
+            else None
+        )
+        scene = (
+            app.state.repository.get_scene(analysis.scene_id)
+            if analysis.scene_id is not None
+            else None
+        )
+        configuration = (
+            app.state.repository.get_historical_configuration(analysis.configuration_id)
+            if analysis.configuration_id is not None
+            else None
+        )
+        if video is None or video.analysis_id != analysis_id:
+            missing.append("VIDEO")
+        if scene is None or scene.analysis_id != analysis_id:
+            missing.append("SCENE")
+        if (
+            configuration is None
+            or configuration.configuration_type != "HISTORICAL"
+            or configuration.analysis_id != analysis_id
+        ):
+            missing.append("CONFIGURATION")
+        missing = list(dict.fromkeys(missing))
+        if missing:
+            raise ApiError(
+                "WE0202",
+                "historical analysis is not ready",
+                data={"missingResources": missing},
+            )
+        now = _timestamp()
+        task = TaskRecord(
+            task_id=_new_id("task"),
+            input_type="HISTORICAL_VIDEO",
+            camera_id=None,
+            video_id=analysis.video_id,
+            configuration_id=analysis.configuration_id or "",
+            persist_pose_and_trajectory=(
+                True if body is None else body.options.persist_pose_and_trajectory
+            ),
+            status=TaskStatus.CREATED,
+            created_at=now,
+            updated_at=now,
+            analysis_id=analysis_id,
+        )
+        try:
+            app.state.repository.add_historical_task(analysis_id, task, updated_at=now)
+        except ValueError as error:
+            raise ApiError("WE0202", str(error), status_code=409) from error
+        if app.state.task_manager is not None:
+            task = app.state.task_manager.start(task.task_id)
+        return JSONResponse(
+            status_code=201,
+            content=_envelope(request, data=_task_payload(task)),
         )
 
     @app.post("/api/work-efficiency/v1/cameras", dependencies=[Depends(authorize)])
@@ -402,9 +611,9 @@ def create_app(
     async def create_task(request: Request, body: TaskCreateRequest) -> JSONResponse:
         _validate_task_input(body)
         configuration = app.state.repository.get_configuration(body.configuration_id)
-        if configuration is None:
+        if configuration is None or configuration.configuration_type != "REALTIME":
             raise ApiError(
-                "WE0202", f"configuration is not active: {body.configuration_id}"
+                "WE0202", f"realtime configuration is not active: {body.configuration_id}"
             )
         _validate_task_resource(app.state.repository, body, configuration)
         now = _timestamp()
@@ -456,6 +665,7 @@ def create_app(
         data = {
             **_task_payload(task),
             "processedFrames": snapshot.processed_frames,
+            "analyzedFrames": snapshot.analyzed_frames,
             "progress": snapshot.progress,
             "currentTimestampSec": None if latest is None else latest.timestamp_sec,
         }
@@ -593,14 +803,11 @@ def _timestamp() -> str:
 
 
 def _validate_task_input(body: TaskCreateRequest) -> None:
-    if body.input_type == "CAMERA_STREAM":
-        valid = body.camera_id is not None and body.video_id is None
-    else:
-        valid = body.video_id is not None and body.camera_id is None
+    valid = body.camera_id is not None and body.video_id is None
     if not valid:
         raise ApiError(
             "WE0101",
-            "CAMERA_STREAM requires only cameraId; VIDEO_FILE requires only videoId",
+            "CAMERA_STREAM requires cameraId and does not accept videoId",
         )
 
 
@@ -610,30 +817,18 @@ def _validate_task_resource(
     configuration: ConfigurationRecord,
 ) -> None:
     configured_camera_id = configuration.payload.get("request", {}).get("cameraId")
-    if body.input_type == "VIDEO_FILE":
-        video = repository.get_video(body.video_id or "")
-        if video is None:
-            raise ApiError("WE0201", f"video is not registered: {body.video_id}")
-        source_camera_id = video.camera_id
-    else:
-        camera = repository.get_camera(body.camera_id or "")
-        if camera is None:
-            raise ApiError("WE0201", f"camera is not registered: {body.camera_id}")
-        source_camera_id = camera.camera_id
+    camera = repository.get_camera(body.camera_id or "")
+    if camera is None:
+        raise ApiError("WE0201", f"camera is not registered: {body.camera_id}")
+    source_camera_id = camera.camera_id
     if configured_camera_id != source_camera_id:
-        source_id = body.video_id if body.input_type == "VIDEO_FILE" else body.camera_id
-        source_details = (
-            {"videoId": body.video_id, "videoCameraId": source_camera_id}
-            if body.input_type == "VIDEO_FILE"
-            else {"cameraId": body.camera_id}
-        )
         raise ApiError(
             "WE0202",
             "input source and configuration belong to different camera viewpoints",
             data={
                 "inputType": body.input_type,
-                "sourceId": source_id,
-                **source_details,
+                "sourceId": body.camera_id,
+                "cameraId": body.camera_id,
                 "configurationId": configuration.configuration_id,
                 "sourceCameraId": source_camera_id,
                 "configurationCameraId": configured_camera_id,
@@ -643,52 +838,192 @@ def _validate_task_resource(
         )
 
 
-def _require_video(repository: InMemoryRepository, video_id: str) -> VideoRecord:
-    video = repository.get_video(video_id)
-    if video is None:
-        raise ApiError("WE0201", f"video is not registered: {video_id}", status_code=404)
-    return video
-
-
-def _video_payload(video: VideoRecord) -> dict:
+def _historical_video_payload(video: VideoRecord) -> dict:
     return {
         "videoId": video.video_id,
-        "cameraId": video.camera_id,
         "width": video.width,
         "height": video.height,
         "fps": video.fps,
         "frameCount": video.frame_count,
         "durationSec": video.duration_sec,
-        "previewUrl": f"/api/work-efficiency/v1/videos/{video.video_id}/preview",
-        "compatibleConfigurationsUrl": (
-            f"/api/work-efficiency/v1/videos/{video.video_id}/compatible-configurations"
+        "previewUrl": (
+            f"/api/work-efficiency/v1/historical-analyses/"
+            f"{video.analysis_id}/video/preview"
         ),
     }
 
 
-def _configuration_compatibility(
-    video: VideoRecord, configuration: ConfigurationRecord
-) -> dict:
-    request = configuration.payload.get("request", {})
-    configuration_camera_id = request.get("cameraId")
-    response = configuration.payload.get("response", {})
-    status = response.get("status", "ACTIVE")
-    reasons = []
-    if configuration_camera_id != video.camera_id:
-        reasons.append("CAMERA_ID_MISMATCH")
-    if status != "ACTIVE":
-        reasons.append("CONFIGURATION_NOT_ACTIVE")
+def _historical_scene_payload(scene: SceneRecord) -> dict:
     return {
-        "configurationId": configuration.configuration_id,
-        "cameraId": configuration_camera_id,
-        "sceneId": request.get("sceneId"),
-        "calibrationVersion": configuration.calibration_version,
-        "areaVersion": configuration.area_version,
-        "status": status,
-        "quality": response.get("quality"),
-        "compatible": not reasons,
-        "incompatibleReasons": reasons,
+        "sceneId": scene.scene_id,
+        "imageUrl": scene.image_url,
+        "width": scene.width,
+        "height": scene.height,
     }
+
+
+def _historical_analysis_payload(app: FastAPI, analysis: HistoricalAnalysisRecord) -> dict:
+    video = (
+        app.state.repository.get_video(analysis.video_id)
+        if analysis.video_id is not None
+        else None
+    )
+    scene = (
+        app.state.repository.get_scene(analysis.scene_id)
+        if analysis.scene_id is not None
+        else None
+    )
+    configuration = (
+        app.state.repository.get_historical_configuration(analysis.configuration_id)
+        if analysis.configuration_id is not None
+        else None
+    )
+    return {
+        "analysisId": analysis.analysis_id,
+        "preparationStatus": analysis.preparation_status.value,
+        "video": None if video is None else _historical_video_payload(video),
+        "scene": None if scene is None else _historical_scene_payload(scene),
+        "configuration": None
+        if configuration is None
+        else {
+            "historicalConfigurationId": configuration.configuration_id,
+            "calibrationVersion": configuration.calibration_version,
+            "areaVersion": configuration.area_version,
+            "quality": configuration.payload.get("response", {}).get("quality"),
+        },
+        "latestTaskId": analysis.latest_task_id,
+        "createdAt": analysis.created_at,
+        "updatedAt": analysis.updated_at,
+    }
+
+
+def _require_historical_analysis(
+    repository: InMemoryRepository, analysis_id: str
+) -> HistoricalAnalysisRecord:
+    analysis = repository.get_historical_analysis(analysis_id)
+    if analysis is None:
+        raise ApiError(
+            "WE0201", f"historical analysis not found: {analysis_id}", status_code=404
+        )
+    return analysis
+
+
+def _require_editable_historical_analysis(
+    repository: InMemoryRepository, analysis_id: str
+) -> HistoricalAnalysisRecord:
+    analysis = _require_historical_analysis(repository, analysis_id)
+    if analysis.preparation_status == HistoricalPreparationStatus.LOCKED:
+        raise ApiError(
+            "WE0202",
+            "historical analysis inputs are locked",
+            status_code=409,
+            data={"suggestedAction": "CREATE_NEW_HISTORICAL_ANALYSIS"},
+        )
+    return analysis
+
+
+def _historical_video(
+    repository: InMemoryRepository, analysis: HistoricalAnalysisRecord
+) -> VideoRecord:
+    video = (
+        repository.get_video(analysis.video_id)
+        if analysis.video_id is not None
+        else None
+    )
+    if video is None or video.analysis_id != analysis.analysis_id:
+        raise ApiError("WE0201", "historical video is unavailable", status_code=404)
+    return video
+
+
+def _missing_historical_resources(analysis: HistoricalAnalysisRecord) -> list[str]:
+    missing = []
+    if analysis.video_id is None:
+        missing.append("VIDEO")
+    if analysis.scene_id is None:
+        missing.append("SCENE")
+    if analysis.configuration_id is None:
+        missing.append("CONFIGURATION")
+    return missing
+
+
+def _discard_historical_configuration(
+    repository: InMemoryRepository, analysis: HistoricalAnalysisRecord
+) -> None:
+    if analysis.configuration_id is not None:
+        repository.remove_historical_configuration(analysis.configuration_id)
+
+
+def _remove_replaced_video(app: FastAPI, video_id: str | None) -> None:
+    if video_id is None:
+        return
+    old = app.state.repository.get_video(video_id)
+    if old is None:
+        return
+    old_path = Path(old.path).resolve()
+    if old_path.is_relative_to(app.state.video_directory):
+        old_path.unlink(missing_ok=True)
+    app.state.repository.remove_video(video_id)
+
+
+async def _decode_scene_upload(file: UploadFile) -> tuple[bytes, int, int]:
+    if file.content_type not in ALLOWED_SCENE_MEDIA_TYPES:
+        raise ApiError("WE0101", "scene file must be PNG or JPEG")
+    content = await file.read(MAX_SCENE_FILE_BYTES + 1)
+    if len(content) > MAX_SCENE_FILE_BYTES:
+        raise ApiError("WE0101", "scene file exceeds 20 MB")
+    image = cv2.imdecode(np.frombuffer(content, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+    if image is None:
+        raise ApiError("WE0101", "scene file is not a valid image")
+    height, width = image.shape[:2]
+    return content, int(width), int(height)
+
+
+def _calculate_historical_configuration(
+    body: HistoricalConfigurationRequest,
+    video: VideoRecord,
+    scene: SceneRecord,
+    max_mean_reprojection_error_px: float,
+) -> tuple[tuple[WorkArea, ...], Any]:
+    try:
+        if any(
+            pair.video_point.x < 0
+            or pair.video_point.y < 0
+            or pair.video_point.x > video.width
+            or pair.video_point.y > video.height
+            for pair in body.feature_pairs
+        ):
+            raise ValueError("calibration video points must lie within the video frame")
+        areas = tuple(
+            WorkArea(
+                area.area_id,
+                tuple((point.x, point.y) for point in area.polygon),
+                area.expected_worker_count,
+                area.required_team_work_duration_sec,
+            )
+            for area in body.work_areas
+        )
+        validate_work_areas(areas)
+        calibration = calibrate_homography(
+            tuple(
+                CalibrationPointPair(
+                    (pair.video_point.x, pair.video_point.y),
+                    (pair.scene_point.x, pair.scene_point.y),
+                )
+                for pair in body.feature_pairs
+            ),
+            scene_width=scene.width,
+            scene_height=scene.height,
+        )
+        if calibration.mean_error_px > max_mean_reprojection_error_px:
+            raise ValueError(
+                "calibration mean reprojection error exceeds "
+                f"{max_mean_reprojection_error_px:g} px"
+            )
+    except ValueError as error:
+        message = str(error)
+        code = "WE0102" if "calibration" in message or "homography" in message else "WE0103"
+        raise ApiError(code, message) from error
+    return areas, calibration
 
 
 def _read_video_preview(video: VideoRecord, timestamp_sec: float) -> bytes:
@@ -729,7 +1064,7 @@ def _require_task(repository: InMemoryRepository, task_id: str) -> TaskRecord:
 
 
 def _task_payload(task: TaskRecord) -> dict:
-    return {
+    payload = {
         "taskId": task.task_id,
         "inputType": task.input_type,
         "cameraId": task.camera_id,
@@ -741,7 +1076,11 @@ def _task_payload(task: TaskRecord) -> dict:
         "updatedAt": task.updated_at,
         "failureCode": task.failure_code,
         "failureMessage": task.failure_message,
+        "analysisId": task.analysis_id,
     }
+    if task.input_type == "HISTORICAL_VIDEO":
+        payload["historicalConfigurationId"] = task.configuration_id
+    return payload
 
 
 def _frame_result_payload(frame: Any) -> dict:
