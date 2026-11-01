@@ -63,6 +63,7 @@ class EngineConfig:
     lost_track_tolerance_sec: float = 2.0
     keypoint_confidence: float = 0.25
     max_frame_gap_sec: float = 2.0
+    team_exit_grace_sec: float = 20 * 60.0
 
     def __post_init__(self) -> None:
         values = (
@@ -70,9 +71,10 @@ class EngineConfig:
             self.exit_detection_duration_sec,
             self.lost_track_tolerance_sec,
             self.max_frame_gap_sec,
+            self.team_exit_grace_sec,
         )
-        if any(value < 0 for value in values):
-            raise ValueError("duration settings must be non-negative")
+        if any(not isfinite(value) or value < 0 for value in values):
+            raise ValueError("duration settings must be finite and non-negative")
         if not 0 <= self.keypoint_confidence <= 1:
             raise ValueError("keypoint_confidence must be between 0 and 1")
 

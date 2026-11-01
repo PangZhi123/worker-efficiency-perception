@@ -3,15 +3,17 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from .analysis import AnalysisResultStore, VideoAnalysisWorker, build_yolo_tracker_factory
+from .analysis import VideoAnalysisWorker, build_yolo_tracker_factory
 from .api import create_app
-from .api.repository import InMemoryRepository
 from .tracker import PoseTrackerConfig
 
 
 def build_app():
-    repository = InMemoryRepository()
-    result_store = AnalysisResultStore()
+    from .persistence import JsonArchive, JsonRepository, JsonResultStore
+
+    database = JsonArchive(os.getenv("WORK_EFFICIENCY_RESULTS_DIRECTORY", "data/results"))
+    repository = JsonRepository(database)
+    result_store = JsonResultStore(database, repository)
     configured_path = os.getenv("WORK_EFFICIENCY_MODEL_PATH")
     model_path = Path(configured_path) if configured_path else Path("model/yolo11m-pose.pt")
     worker = None
@@ -27,13 +29,15 @@ def build_app():
             build_yolo_tracker_factory(tracker_config),
             result_store,
         )
-    return create_app(
+    app = create_app(
         repository=repository,
         analysis_worker=worker,
         analysis_result_store=result_store,
         bearer_token=os.getenv("WORK_EFFICIENCY_BEARER_TOKEN"),
         video_directory=os.getenv("WORK_EFFICIENCY_VIDEO_DIRECTORY", "data/videos"),
     )
+    app.router.add_event_handler("shutdown", database.close)
+    return app
 
 
 app = build_app()

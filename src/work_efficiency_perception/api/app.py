@@ -23,6 +23,7 @@ from fastapi import (
 )
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
+from fastapi.staticfiles import StaticFiles
 
 from ..calibration import calibrate_homography, validate_work_areas
 from ..models import CalibrationPointPair, WorkArea
@@ -684,6 +685,23 @@ def create_app(
             content=_envelope(request, data=_frame_result_payload(snapshot.latest_frame))
         )
 
+    @app.get("/api/work-efficiency/v1/tasks", dependencies=[Depends(authorize)])
+    async def list_saved_tasks(request: Request) -> JSONResponse:
+        return JSONResponse(content=_envelope(request, data={"items": [
+            _task_payload(task) for task in app.state.repository.list_tasks()]}))
+
+    @app.get("/api/work-efficiency/v1/tasks/{task_id}/frames", dependencies=[Depends(authorize)])
+    async def get_saved_frames(
+        request: Request, task_id: str,
+        after_seq: Annotated[int, Query(alias="afterSeq", ge=-1)] = -1,
+        limit: Annotated[int, Query(ge=1, le=1000)] = 100,
+    ) -> JSONResponse:
+        _require_task(app.state.repository, task_id)
+        store = app.state.analysis_result_store
+        if not hasattr(store, "read_frames"):
+            raise ApiError("WE0201", "persistent result store is not enabled")
+        return JSONResponse(content=_envelope(request, data=store.read_frames(task_id, after_seq, limit)))
+
     @app.get("/api/work-efficiency/v1/team-efficiency", dependencies=[Depends(authorize)])
     async def get_team_efficiency(
         request: Request,
@@ -790,6 +808,10 @@ def create_app(
             pass
         finally:
             subscription.close()
+
+    web_directory = Path(__file__).resolve().parents[1] / "web"
+    if web_directory.is_dir():
+        app.mount("/test-ui", StaticFiles(directory=web_directory, html=True), name="test-ui")
 
     return app
 
