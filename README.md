@@ -1,144 +1,172 @@
-# 施工人员工效智能感知后端算法
+# 施工人员工效智能感知
 
-独立 Python 工程，依据《施工人员工效智能感知功能及前后端接口规范-0825》实现。首版采用 Ultralytics YOLO Pose + ByteTrack，输出姿态骨架、视频内人员轨迹、总平图位置、工作区状态、区域人数和班组合格工效时长。
+通过施工现场视频检测人员姿态、跟踪人员位置，结合相机标定和工作区域配置，统计区域人数、人员状态及班组合格工效时长。
 
-## 能力边界
+**当前版本：2026-11-03。**实时与历史分析的使用流程按物料工程对齐，工效保留自己的人员识别、多区域配置和计工规则。默认使用本地 JSON 持久化资源、任务和分析结果，服务重启后可继续查询已保存数据。
 
-通用姿态模型可以可靠支撑“人员在哪里、是否进入工作区、人数是否达标”的计算与证据回放，但不能直接证明人员正在执行某个具体工序。当前 `WORKING` 定义为经过进入滞回确认后处于工作区域内。具体动作识别需要后续使用现场标注数据训练时序分类模型。
+## 设计思路
 
-### 班组连续计工规则（2026-10-31）
+视频输入、场景配置、分析任务和结果查询分开管理。前端负责选择视频与配置、标定划区、启动停止和展示结果；后端负责保存配置、调度任务、执行人员分析及累计区域工效。
 
-- 已确认进入工作区的人员，未观察到出界而检测丢失时，计工人数无限期保留，直到任务结束或观察到对应出界；不因丢轨超时扣减。
-- 出界仍按 `exitDetectionDurationSec` 防抖确认，防抖期间继续计工；确认离开后进入固定 1200 秒（20 分钟）宽限期。若出界候选人员随后消失，按出界候选起点加防抖时长确认，避免无限保留已观察到的出界。
-- 同一区域有人经 `entryDetectionDurationSec` 确认进入时，优先抵消最早到期的临时离开人数，不要求同一人员 ID。宽限期到期即扣减人数，前 20 分钟保留计工，不追溯扣时。恰好到期的进入按新进入处理。
-- 新 ID 直接出现在区内、没有观察到外部进入过程时，可接替同区域当前未检测到的保留名额；同时可见人员不会互相合并。明确观察到从外部进入、且没有临时离开人数时，增加人数。
-- `actualWorkingCount` 表示班组有效计工人数，包含区内丢失保留人数和临时离开宽限人数，可能大于当前 `persons` 数量。`persons` 只输出当前检测到的人员，不伪造缺失人员的骨架或位置；已确认在区外的人员仍显示 `OUTSIDE`。
-- 人数达到 `expectedWorkerCount` 时累计班组合格工时。即使帧落在宽限期到期时间两侧，也按到期时间切分计时；断流/长帧间隔的工时仍受原有保护上限限制。
-- 实时与历史分析共用此规则，前端 JSON、上传表单和响应字段结构均不变，20 分钟规则由后端默认启用。原有 `exitDetectionDurationSec` 仍表示出界防抖秒数，不要改传 1200。
+实时与历史分析共用人员姿态检测、ByteTrack 跟踪、坐标投影和工效计算逻辑。每次新建配置保留独立 ID，任务创建时保存配置快照，通过 taskId 追溯本次使用的配置和结果。
 
-该规则是班组人数保留策略，不是长期身份识别。遮挡住的进出、跟踪 ID 变化和重复检测仍可能造成误差：新 ID 直接出现在区内时，无法可靠区分“遮挡后重现”与“未拍到进入过程的新成员”。应保证出入口可见并进行现场验证。服务重启、任务重试或新任务不会继承之前的保留人数。
+## 第一版的五个功能
 
-## 本地环境
+### 1. 相机管理
 
-工程不包含任何虚拟环境、模型权重或运行缓存。开发人员可以使用已有 Python 环境直接安装依赖：
+登记 cameraId 与 RTSP/RTMP 视频流地址，为实时分析提供输入。历史视频上传时的 cameraId 用于登记录像来源，不要求实时相机在线。
 
-```powershell
-python -m pip install -r requirements-dev.txt
-python -m pytest
+### 2. 实时工效分析
+
+选择相机及适用配置，创建 CAMERA_STREAM 任务。系统检测人员、跟踪轨迹，将人员位置投影到场景图，判断工作区域状态并累计人数和工效。
+
+实时任务须使用与 cameraId 匹配的实时配置，不能使用视频专属配置。同一相机同时只允许一个实时任务，可查询状态、请求停止并查看结果。
+
+### 3. 历史视频分析
+
+按照物料工程的流程，先上传录像取得 videoId，再选择已有 configurationId。可以复用相机配置、其他视频配置或当前视频配置；没有适用配置时，再上传场景图、标定划区并新建配置。
+
+```text
+上传 MP4 → videoId
+               ↓
+选择已有 configurationId，或上传场景图并新建配置
+               ↓
+确定有效且带时区的录像开始时间
+               ↓
+创建 VIDEO_FILE 任务 → taskId → 查询进度和结果 / 请求停止
 ```
 
-如需隔离环境，可在工程外创建环境，或自行创建本地 `.venv`；`.gitignore` 已确保它不会进入版本库。
+历史任务不再要求配置绑定当前 videoId，也不要求配置所属相机与录像来源一致；选择配置时应确认标定、区域和实际画面适用。工效支持多个工作区域，不复制物料的单区域限制。
 
-## 启动 API
+**全局同时只允许一个历史任务，历史与实时任务可并行，即使来自同一相机。**历史任务排队、运行或处于 STOPPING 时，新历史任务返回 HTTP 409 / WE0203；需等到 STOPPED、COMPLETED 或 FAILED 后再启动。新旧历史接口共用这一名额。
 
-在源码目录模式下可直接启动开发服务：
+录像开始时间优先使用启动时的 recordingStartedAt；未传时使用视频上传信息中的 capturedAt。新 VIDEO_FILE 任务必须具备有效、带时区的录像时间，例如 `2026-11-03T09:00:00+08:00`，否则返回 422。结果时间按“录像开始时间 + 视频内时间”计算，任务创建时间另行保留。
 
-```powershell
-$env:PYTHONPATH = "src"
-python -m uvicorn work_efficiency_perception.main:app --reload
+停止、失败或完成后，可以用同一视频和配置创建新的 taskId，从头重新分析，不是断点续跑。旧 historical-analyses 接口暂时保留兼容，新对接统一使用 VIDEO_FILE 流程。
+
+### 4. 工效结果查询
+
+实时与历史结果使用同一套保存和查询方式，通过 taskId 区分分析批次。可查询任务状态、处理进度、最新人员与区域数据、区域工效汇总和已保存的帧结果，也支持 WebSocket 推送。
+
+历史任务的时间查询使用录像开始时间筛选任务，返回该任务的完整汇总，不按查询窗口重新切分工时。工作台可加载重启前已保存的任务；目前没有可视化历史轨迹回放页面。
+
+### 5. 场景与配置管理
+
+上传 PNG/JPEG 场景图，通过至少四对不共线的对应点建立视频与场景的转换关系，再绘制工作区域，配置计划人数、要求工时和识别参数。
+
+已有配置可直接选用；重新标定时创建新的 configurationId。新建视频专属场景和配置时仍检查资源绑定关系，任务创建时则允许选择已有适用配置。
+
+任务保存独立的 configurationSnapshot，执行和归档使用该快照，后续配置变化不会改变已提交任务的分析条件。
+
+## 2026-11-03 更新
+
+| 方面 | 当前修改 |
+| --- | --- |
+| 录像上传 | 提供 multipart `/videos`，返回 videoId；补齐 MP4、空文件、大小校验、SHA256 去重和失败清理 |
+| 历史流程 | 使用 videoId + configurationId 启动 VIDEO_FILE 任务，支持复用已有配置 |
+| 任务冲突 | 历史全局单任务，实时按相机互斥；实时与历史独立调度，停止中继续占位 |
+| 录像时间 | 新增 recordingStartedAt，回退到 capturedAt；新历史任务要求有效且带时区的时间 |
+| 配置与持久化 | 在已有 JSON 持久化基础上，补齐任务配置快照、录像时间和资源元数据的保存及恢复 |
+| 测试工作台 | 支持视频上传预览、新建或复用配置、录像时间输入、启动停止及已保存结果查询 |
+| 文档与验证 | 更新接口说明、1103 Word 和修改记录；87 项自动化测试通过，两条浏览器操作流程通过 |
+
+本次调整接口、调度、配置和时间输入，人员识别及工效计算规则保持不变。真实 YOLO 效果和远端 Java 联调仍需部署后验收。详细过程见[今日修改记录](docs/2026-11-03历史视频流程对齐记录.md)。
+
+## 持久化与重启恢复
+
+默认入口 `work_efficiency_perception.main:app` 已启用本地 JSON 持久化，**无需安装数据库即可保存和读取结果**。目前使用文件仓储；MySQL 仅有初版表结构，尚未接入运行，旧 SQLite 数据也不会自动迁移。
+
+| 保存内容 | 用途 |
+| --- | --- |
+| 相机、视频、场景和配置 | 恢复资源索引、读取素材及选择配置 |
+| 任务信息与配置快照 | 记录本次输入、配置、转换矩阵和录像时间 |
+| 最新结果与进度 | 服务重启后继续查询已提交结果 |
+| 人员与区域帧结果 | 保存实际推理帧的人员数据及区域统计，支持分页读取 |
+| 累计工效与 30 秒快照 | 查看任务整体工效、达标/不足区间和过程快照 |
+
+默认目录：
+
+```text
+data/
+  videos/                              # 上传的原始 MP4
+  results/
+    resources.json                     # 资源与任务恢复索引，包含场景图及配置
+    tasks/<taskId>/
+      task_configuration.json          # 任务、配置快照、单应矩阵、视频信息及场景图
+      snapshot.json                    # 最新结果、进度及区间恢复数据
+      efficiency_overall.json          # 整体累计工效与达标/不足区间
+      persons/frame_*.json             # 实际推理帧的人员及区域数据
+      efficiency_30s/at_*.json          # 视频时间 30、60、90 秒等节点的工效快照
 ```
 
-默认使用 `model/yolo11m-pose.pt`（文件存在时自动启用真实分析工作器）。也可以通过环境变量配置：
+场景图以 Base64 保存，原始视频单独保留；不重复保存原始画面或生成带骨架的视频。关闭 persistPoseAndTrajectory 时，保存的结果剔除人员明细，区域统计继续保存。30 秒快照按视频/输入帧时间触发，不按程序运行耗时触发；只记录实际推理结果，不补造跳过的节点。
+
+服务重启后，已完成、已停止或已失败任务及结果可继续查询；重启时仍未结束的任务标为 FAILED。重新分析会创建新任务，从头处理，不恢复跟踪器、计工人数或执行进度。
+
+当前同一保存目录仅支持一个服务进程。每个 JSON 文件采用临时文件和原子替换写入，多个文件间没有数据库事务；异常断电时最新帧与汇总可能不同步。备份时应正常停止服务后同时复制 results 和 videos 目录；视频路径为绝对路径，迁移后需要调整。文件目前不会自动清理。
+
+## 启动与联调
+
+使用 Python 3.10 及以上版本，在工程根目录执行：
 
 ```powershell
-$env:WORK_EFFICIENCY_MODEL_PATH = "model/yolo11m-pose.pt"
-$env:WORK_EFFICIENCY_DEVICE = "0"
-$env:WORK_EFFICIENCY_IMAGE_SIZE = "1280"
-```
-
-历史视频自 2026-11-03 起按物料流程对接：`上传视频 → videoId → 选择已有配置或新建配置 → configurationId + 带时区的录像开始时间 → 创建 VIDEO_FILE 任务 → taskId → 查询或停止`。详见 [历史视频接口规范](docs/history_video_api.md)、[1103 Word 规范](docs/施工人员工效智能感知历史视频接口规范-1103.docx)、[修改记录](docs/2026-11-03历史视频流程对齐记录.md)。0825/0902 Word 的历史流程保留为旧版资料，以本次规范为准。
-
-当前已提供：
-
-- `GET /health`：健康检查；
-- `POST /api/work-efficiency/v1/videos`：multipart 上传录像（file、cameraId、可选 capturedAt），返回 videoId；
-- `GET /api/work-efficiency/v1/videos`：列出已登记录像；
-- `GET /api/work-efficiency/v1/videos/{videoId}`：读取录像信息；
-- `GET /api/work-efficiency/v1/videos/{videoId}/preview`：读取代表帧；
-- `POST /api/work-efficiency/v1/scenes`：上传 PNG/JPEG 场景图，历史模式携带 videoId；
-- `GET /files/scenes/{sceneId}`：读取已上传的场景图；
-- `POST /api/work-efficiency/v1/configurations`：提交相机或 videoId 专属的标定和工作区配置；
-- `POST /api/work-efficiency/v1/historical-analyses`：创建独立历史分析记录（旧接口兼容，新对接不使用）；
-- `GET /api/work-efficiency/v1/historical-analyses/{analysisId}`：查询历史分析准备状态；
-- `POST /api/work-efficiency/v1/historical-analyses/{analysisId}/video`：上传专属历史 MP4；
-- `POST /api/work-efficiency/v1/historical-analyses/{analysisId}/scene`：上传专属场景图；
-- `GET /api/work-efficiency/v1/historical-analyses/{analysisId}/video/preview`：获取代表帧；
-- `PUT /api/work-efficiency/v1/historical-analyses/{analysisId}/configuration`：保存历史标定和区域配置；
-- `POST /api/work-efficiency/v1/historical-analyses/{analysisId}/tasks`：启动或重试历史任务；
-- `POST /api/work-efficiency/v1/cameras`：登记实时 RTSP/RTMP 地址；
-- `POST /api/work-efficiency/v1/tasks`：创建 CAMERA_STREAM 或 VIDEO_FILE 任务，历史模式传 videoId + configurationId，并确保有效的录像开始时间；
-- `GET /api/work-efficiency/v1/tasks/{taskId}`：查询任务状态；
-- `PATCH /api/work-efficiency/v1/tasks/{taskId}`：使用 `{"action":"STOP"}` 幂等停止任务。
-- `GET /api/work-efficiency/v1/tasks/{taskId}/progress`：查询处理进度；
-- `GET /api/work-efficiency/v1/tasks/{taskId}/latest-result`：查询最新人员与区域结果；
-- `GET /api/work-efficiency/v1/team-efficiency`：使用 `taskId` 或 `startTime/endTime` 查询区域工效汇总。
-- `WS /ws/work-efficiency/v1/tasks/{taskId}`：实时推送 `FRAME_RESULT/ERROR`；启用鉴权时可使用 Bearer Header 或 `access_token` 查询参数。
-
-默认启动入口现已使用本地 JSON 文件 保存场景、配置、任务和分析结果，服务重启后可查询。模型文件存在时任务会自动进入后台分析；模型未配置时任务保持 `CREATED`。MySQL 仓储仍待接入。
-
-实时与历史复用场景、配置和任务接口，通过 videoId 登记历史素材；历史任务允许选择已有相机或其他视频配置，创建时保存独立配置快照。录像时间优先取 recordingStartedAt，未传则使用视频 capturedAt，必须有效且带时区。新 VIDEO_FILE 任务停止、失败或完成后均可创建新 taskId 从头分析。全局最多运行一个历史任务，实时与历史任务可并行；实时任务按相机互斥。历史任务停止中仍占用历史名额，需等待终态。旧 historical-analyses 继续保持输入锁定规则。历史视频默认按 200 ms 间隔抽帧推理（最高约 5 FPS），并始终分析首帧和末帧；实时流继续采用只保留最新帧的自适应丢帧策略。进度接口中的 `processedFrames` 表示已解码到的原始帧位置，`analyzedFrames` 表示实际执行模型推理的帧数。
-
-MySQL 8 初版表结构位于 `db/mysql_schema.sql`，正式数据库连接参数确认后再实现持久化仓储。
-
-## 包结构
-
-- `tracker.py`：Ultralytics Pose + ByteTrack 适配器；
-- `video.py`：统一帧源、历史视频读取、实时流最新帧缓冲和断流重连；
-- `analysis.py`：历史视频/实时相机共用的分析工作器和最新结果快照；
-- `geometry.py`：人员锚点、单应性投影、多边形判定；
-- `engine.py`：人员进出滞回、丢轨容忍、人数及工效时长累计；
-- `models.py`：领域模型和枚举；
-- `docs/`：可行性、算法链路和验收建议；
-- `tests/`：不依赖模型权重或 GPU 的核心逻辑测试。
-
-## 模型要求
-
-使用 Ultralytics Pose 模型，例如官方 COCO 17 点姿态模型或基于现场数据微调后的模型。权重通过部署配置传入，禁止复制到源码包或提交到版本库。
-
-## 本地前端测试工作台
-
-从工程根目录启动（保持根目录为工作目录，以便加载 model 下的模型）：
-
-```powershell
+python -m pip install -r requirements-api.txt
 $env:PYTHONPATH = "src"
 python -m uvicorn work_efficiency_perception.main:app --host 127.0.0.1 --port 8000
 ```
 
-打开 http://127.0.0.1:8000/test-ui/ 。页面与 API 同源，无需 Node 或额外前端依赖。启用鉴权时在页面填写 Bearer Token。
+打开[测试工作台](http://127.0.0.1:8000/test-ui/) 或 [API 文档](http://127.0.0.1:8000/docs)。工作台与 API 同源，无需额外构建前端；启用鉴权后在页面填写 Bearer Token。
 
-推荐先测“历史分析”：填写来源相机 ID，上传 `cam1_5min_clip.mp4` 取得 videoId，选择已有 configurationId 并点击“读取所选配置”，或上传对应场景图后在两张图片上按同一顺序点击至少四对不共线的对应点；切换到绘制区域模式，在右图点击至少三个顶点并完成区域；新建配置需要保存；填写带时区的录像开始时间（或使用视频已有 capturedAt）后启动分析。结果查询页支持进度、最新人员数据、区域工效、自动刷新、停止任务和 JSON 下载。没有现场相机也能完成此流程。
+默认模型为 `model/yolo11m-pose.pt`。仓库中的权重由 Git LFS 管理，需确保本地取得实际模型文件；也可通过环境变量指定部署权重。模型文件不存在时不会启用分析工作器，不能把任务创建成功当作人员识别已经开始。
 
-相机管理仅提供登记入口；实时分析通过可编辑 JSON 提交相机配置并启动任务；场景管理支持上传和预览实时场景图。实时 JSON 初始坐标只是结构示例，需改为实际画面与场景对应坐标。页面不是完整的生产管理系统，人员结果以 JSON 展示，不包含历史轨迹回放。已有素材可按 videoId 和 configurationId 读取，画布编辑点不会从已有配置自动恢复。旧 analysisId 记录仍可通过兼容接口查询。默认启动入口会保存记录到本地 JSON 文件。
+| 环境变量 | 默认值或作用 |
+| --- | --- |
+| WORK_EFFICIENCY_MODEL_PATH | `model/yolo11m-pose.pt`，姿态模型路径 |
+| WORK_EFFICIENCY_DEVICE | 未设置，使用模型运行时默认设备 |
+| WORK_EFFICIENCY_IMAGE_SIZE | `1280`，推理尺寸 |
+| WORK_EFFICIENCY_RESULTS_DIRECTORY | `data/results`，JSON 保存目录 |
+| WORK_EFFICIENCY_VIDEO_DIRECTORY | `data/videos`，原始视频目录 |
+| WORK_EFFICIENCY_MAX_VIDEO_BYTES | `5368709120`，默认上传上限 5 GiB |
+| WORK_EFFICIENCY_BEARER_TOKEN | 未设置，启用时要求 Bearer Token |
 
-## 本地结果持久化（JSON 文件）
+直接调用 `create_app()` 默认使用内存仓储供测试；要使用上述持久化能力，应启动 `main:app`。部署更新后需重启服务，Java 端按新规范传入所选配置和录像时间。
 
-默认启动入口 `main:app` 自动保存至 `data/results/`，可通过环境变量 `WORK_EFFICIENCY_RESULTS_DIRECTORY` 指定目录，无需数据库。仅支持单个服务进程使用同一目录。直接调用 `create_app()` 默认仍使用内存仓储供测试。
+## 接口流程速查
 
-```text
-data/results/
-  resources.json                       # 资源索引与恢复数据，含场景图和配置
-  tasks/<taskId>/
-    task_configuration.json            # 任务、完整配置、转换矩阵、视频信息、场景图
-    snapshot.json                      # 最新结果与进度，供重启后恢复查询
-    efficiency_overall.json            # 整体累计工效及达标/不足区间
-    persons/
-      frame_000000000000.json           # 每个实际推理帧的人员及区域结果
-    efficiency_30s/
-      at_000000000030.json              # 30秒节点工效快照
-      at_000000000060.json
-```
+公共前缀：`/api/work-efficiency/v1`。
 
-`task_configuration.json` 明确保存 `homography` 3×3 单应转换矩阵，完整配置内也保留矩阵和标定误差。矩阵将视频像素坐标投影到场景归一化坐标，需进行齐次除法。场景图片以 Base64 存在 JSON 中，原始视频仍保存在 `data/videos`。
+| 操作 | 接口及关键输入 |
+| --- | --- |
+| 上传录像 | `POST /videos`：multipart file、cameraId，可选 capturedAt，返回 videoId |
+| 读取视频 | `GET /videos`、`GET /videos/{videoId}`、`GET /videos/{videoId}/preview` |
+| 新建场景与配置 | `POST /scenes`、`POST /configurations`；已有配置可跳过此步骤 |
+| 读取已有配置 | `GET /configurations/{configurationId}` |
+| 登记实时相机 | `POST /cameras`：cameraId、streamUrl |
+| 启动历史任务 | `POST /tasks`：inputType=VIDEO_FILE、videoId、configurationId、有效录像时间 |
+| 启动实时任务 | `POST /tasks`：inputType=CAMERA_STREAM、cameraId、configurationId |
+| 停止任务 | `PATCH /tasks/{taskId}`：`{"action":"STOP"}`，等待终态后再启动 |
+| 查询已保存任务 | `GET /tasks`、`GET /tasks/{taskId}` |
+| 查询进度和结果 | `GET /tasks/{taskId}/progress`、`GET /tasks/{taskId}/latest-result` |
+| 查询工效及帧明细 | `GET /team-efficiency`、`GET /tasks/{taskId}/frames` |
 
-人员文件保存每个实际推理帧的检测框、骨架、人员 ID、轨迹增量、投影点和区域状态，同时包含对应区域统计；不重复存储原始画面。历史视频默认每200ms推理一次。`persistPoseAndTrajectory=false` 时不落盘人员明细，但区域统计仍保存；`poseSamplingMs` 暂不用于二次抽样。
+请求字段、响应示例、时间优先级及 PowerShell 调用方式见[历史视频接口规范](docs/history_video_api.md)。旧 historical-analyses 接口保留原有兼容规则，新调用方不需要先创建 analysisId。
 
-工效30秒快照按照输入帧的时间戳触发，不按程序运行耗时触发：历史视频处理得再快，也按视频的30、60、90秒等节点保存。在节点之后首个实际推理帧保存，文件同时记录 `scheduledTimestampSec` 和实际 `timestampSec`。遇到跳帧跨过多个节点，只保存实际到达节点所在时段的真实结果，不插值或伪造缺失节点。末尾不足30秒的数据仍保存在整体结果中。整体结果和恢复快照随分析更新，正常完成时进度归一为100%；停止或失败保留已提交结果。
+## 工效计算口径
 
-每个文件通过临时文件、flush/fsync和原子替换写入，避免留下半个JSON。不同文件间不是数据库事务，异常断电时最后一次帧文件与汇总可能不同步。任务状态以 `task_configuration.json` 的任务状态为准。重启后中断任务标记为FAILED，历史任务可以从头重试，不续接跟踪器和计工状态。
+当前 WORKING 表示经进入防抖确认后处于工作区域内，不直接证明人员正在执行某一具体工序。姿态模型输出与跟踪结果仍需现场验证。
 
-页面“结果查询 → 加载已保存任务”可找回任务。接口：
+班组连续计工沿用 2026-10-31 规则：区内丢失且未观察到出界时保留人数；确认出界后保留 20 分钟宽限，新成员可按规则抵消或接替保留名额。actualWorkingCount 是有效计工人数，可能大于当前可见 persons 数量；人数达标时累计合格工时。exitDetectionDurationSec 仍是出界防抖，不要改为 1200。
 
-- `GET /api/work-efficiency/v1/tasks`：任务列表。
-- `GET /api/work-efficiency/v1/tasks/{taskId}/frames?afterSeq=-1&limit=100`：按帧号分页读取，使用 `nextAfterSeq` 继续，limit最大1000。
+完整计工规则、采样方式、包结构和早期部署说明保留在[原首页技术说明存档](docs/README_technical_reference_2026-11-03.md)。
 
-旧 SQLite 文件会保留，但不自动迁移或继续写入。升级前内存中的任务也不会自动迁移，应先导出结果再重启，新建任务验证此保存方式。备份时正常停止服务后复制 `data/results` 和 `data/videos`；原始视频路径是绝对路径，目录迁移需调整。文件会持续增加，当前不自动清理。JSON里包含人员数据和场景图，应按业务数据保管。尚未提供可视化历史回放。
+## 测试与详细文档
+
+开发验证可安装 `requirements-dev.txt` 后运行 `python -m pytest`。2026-11-03 最终代码回归为 **87 passed**，测试不依赖真实模型或 GPU；真实模型精度与现场流仍需单独验收。
+
+- [2026-11-03 修改记录](docs/2026-11-03历史视频流程对齐记录.md)：当天最终结果、接口调整及验证边界。
+- [历史视频接口规范](docs/history_video_api.md)：以物料流程为基准的新对接说明。
+- [1103 Word 规范](docs/施工人员工效智能感知历史视频接口规范-1103.docx)：可供同事查阅的接口文档。
+- [配置 JSON 示例](docs/examples/history-configuration.json)：新建配置时按实际画面替换 ID、标定点和区域。
+- [开发进度](docs/development_progress.md)：当前更新和早期开发记录。
+
+0825/0902 Word 保留为旧版资料，历史视频的新对接流程以当前首页、1103 规范和运行服务的 OpenAPI 为准。
