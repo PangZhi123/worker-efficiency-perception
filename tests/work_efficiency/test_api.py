@@ -303,6 +303,36 @@ def test_failed_historical_task_can_retry_but_completed_task_cannot(tmp_path):
         assert duplicate.json()["code"] == "WE0202"
 
 
+def test_legacy_history_returns_slot_conflict_and_releases_after_stop(tmp_path):
+    client = TestClient(create_app(video_directory=tmp_path / "uploads"))
+    first = prepare_historical_analysis(client, tmp_path)
+    second = prepare_historical_analysis(client, tmp_path)
+    path = "/api/work-efficiency/v1/historical-analyses/"
+    running = client.post(path + first["analysisId"] + "/tasks", json={})
+    assert running.status_code == 201
+    conflict = client.post(path + second["analysisId"] + "/tasks", json={})
+    assert conflict.status_code == 409
+    assert conflict.json()["code"] == "WE0203"
+    assert "historical" in conflict.json()["message"]
+    task_id = running.json()["data"]["taskId"]
+    client.patch(f"/api/work-efficiency/v1/tasks/{task_id}", json={"action": "STOP"})
+    assert client.post(path + second["analysisId"] + "/tasks", json={}).status_code == 201
+
+
+def test_new_history_can_select_legacy_configuration_without_camera_id(tmp_path):
+    client = TestClient(create_app(video_directory=tmp_path / "uploads"))
+    prepared = prepare_historical_analysis(client, tmp_path)
+    video = client.post("/api/work-efficiency/v1/videos", data={"cameraId": "cam_source"},
+        files={"file": ("source.mp4", (tmp_path / "source.mp4").read_bytes(), "video/mp4")})
+    response = client.post("/api/work-efficiency/v1/tasks", json={
+        "inputType": "VIDEO_FILE", "videoId": video.json()["data"]["videoId"],
+        "configurationId": prepared["configuration"]["historicalConfigurationId"],
+        "recordingStartedAt": "2026-11-03T09:00:00+08:00",
+    })
+    assert response.status_code == 200
+    assert response.json()["data"]["configurationSnapshot"]["request"]["sceneId"]
+
+
 def test_missing_historical_analysis_returns_input_unavailable():
     response = TestClient(create_app()).get(
         "/api/work-efficiency/v1/historical-analyses/hist_missing"
@@ -452,7 +482,8 @@ def test_task_rejects_invalid_input_combinations_and_missing_configuration():
             "configurationId": configuration_id,
         },
     )
-    assert legacy_video_task.status_code == 422
+    assert legacy_video_task.status_code == 404
+    assert legacy_video_task.json()["code"] == "WE0201"
 
 
 @pytest.mark.parametrize(

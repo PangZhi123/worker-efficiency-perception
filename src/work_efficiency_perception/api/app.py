@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import os
+from copy import deepcopy
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from hashlib import sha256
 from pathlib import Path
 from typing import Annotated, Any
 from uuid import uuid4
@@ -35,6 +38,7 @@ from .repository import (
     HistoricalPreparationStatus,
     InMemoryRepository,
     SceneRecord,
+    TaskConflictError,
     TaskRecord,
     TaskStatus,
     VideoRecord,
@@ -153,21 +157,132 @@ def create_app(
     async def health() -> dict:
         return {"status": "ok"}
 
+    @app.get("/api/work-efficiency/v1/videos", dependencies=[Depends(authorize)])
+    async def list_videos(request: Request) -> JSONResponse:
+        return JSONResponse(content=_envelope(request, data={"items": [
+            _video_payload(video) for video in app.state.repository.list_videos()
+            if video.analysis_id is None
+        ]}))
+
+    @app.post("/api/work-efficiency/v1/videos", dependencies=[Depends(authorize)])
+    async def upload_video(
+        request: Request,
+        file: Annotated[UploadFile, File()],
+        camera_id: Annotated[str, Form(alias="cameraId", min_length=1, max_length=64)],
+        captured_at: Annotated[str | None, Form(alias="capturedAt")] = None,
+    ) -> JSONResponse:
+        camera_id = camera_id.strip()
+        if not camera_id:
+            raise ApiError("WE0101", "cameraId must not be blank", status_code=422)
+        if captured_at is not None:
+            try:
+                captured_at = datetime.fromisoformat(captured_at.replace("Z", "+00:00")).isoformat()
+            except ValueError as error:
+                raise ApiError("WE0101", "capturedAt must be an ISO 8601 timestamp", status_code=422) from error
+        name = Path((file.filename or "upload.mp4").replace("\\", "/")).name
+        if Path(name).suffix.lower() != ".mp4" or (file.content_type or "application/octet-stream").lower() not in {
+            "video/mp4", "application/mp4", "application/octet-stream",
+        }:
+            raise ApiError("WE0101", "only MP4 video is supported", status_code=415)
+        maximum = int(os.getenv("WORK_EFFICIENCY_MAX_VIDEO_BYTES", str(5 * 1024 ** 3)))
+        directory = app.state.video_directory
+        temporary = directory / f".upload_{uuid4().hex}.mp4"
+        owned_path = temporary
+        digest = sha256()
+        size = 0
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            with temporary.open("xb") as destination:
+                while chunk := await file.read(1024 * 1024):
+                    size += len(chunk)
+                    if size > maximum:
+                        raise ApiError("WE0101", "video exceeds maximum upload size", status_code=413)
+                    digest.update(chunk)
+                    destination.write(chunk)
+            if not size:
+                raise ApiError("WE0101", "video file must not be empty", status_code=422)
+            matching = [v for v in app.state.repository.list_videos()
+                        if v.analysis_id is None and v.sha256 == digest.hexdigest()
+                        and Path(v.path).is_file()]
+            same_camera = next((v for v in matching if v.camera_id == camera_id), None)
+            if same_camera is not None:
+                return JSONResponse(status_code=201, content=_envelope(
+                    request, data=_video_payload(same_camera, deduplicated=True)))
+            video_id = _new_id("video")
+            if matching:
+                video = replace(matching[0], video_id=video_id, camera_id=camera_id,
+                                original_file_name=name, captured_at=captured_at,
+                                uploaded_at=_timestamp())
+            else:
+                from ..video import VideoFileSource
+
+                with VideoFileSource(temporary) as source:
+                    metadata = source.metadata
+                    if not metadata.frame_count or next(iter(source), None) is None:
+                        raise ValueError("video has no decodable frames")
+                final_path = directory / f"{video_id}.mp4"
+                temporary.replace(final_path)
+                owned_path = final_path
+                video = VideoRecord(
+                    video_id, str(final_path), camera_id, metadata.width, metadata.height,
+                    metadata.fps, metadata.frame_count, metadata.duration_sec or 0.0,
+                    original_file_name=name, size_bytes=size, sha256=digest.hexdigest(),
+                    captured_at=captured_at, uploaded_at=_timestamp(),
+                )
+            app.state.repository.add_video(video)
+            if matching:
+                owned_path.unlink(missing_ok=True)
+            owned_path = None
+            return JSONResponse(status_code=201, content=_envelope(
+                request, data=_video_payload(video, deduplicated=bool(matching))))
+        except ValueError as error:
+            raise ApiError("WE0201", f"video cannot be registered: {error}", status_code=422) from error
+        except OSError as error:
+            raise ApiError("WE0401", f"video storage failed: {error}", status_code=500) from error
+        finally:
+            if owned_path is not None:
+                owned_path.unlink(missing_ok=True)
+            await file.close()
+
+    @app.get("/api/work-efficiency/v1/videos/{video_id}", dependencies=[Depends(authorize)])
+    async def get_video(request: Request, video_id: str) -> JSONResponse:
+        video = _require_registered_video(app.state.repository, video_id)
+        return JSONResponse(content=_envelope(request, data=_video_payload(video)))
+
+    @app.get("/api/work-efficiency/v1/videos/{video_id}/preview", dependencies=[Depends(authorize)])
+    async def video_preview(
+        video_id: str,
+        timestamp_sec: Annotated[float, Query(alias="timestampSec", ge=0)] = 0,
+    ) -> Response:
+        video = _require_registered_video(app.state.repository, video_id)
+        if timestamp_sec >= video.duration_sec:
+            raise ApiError("WE0101", "timestampSec exceeds video duration", status_code=422)
+        return Response(_read_video_preview(video, timestamp_sec), media_type="image/jpeg")
+
     @app.post("/api/work-efficiency/v1/scenes", dependencies=[Depends(authorize)])
     async def create_scene(
         request: Request,
         file: Annotated[UploadFile, File()],
         scene_name: Annotated[str, Form(alias="sceneName", min_length=1, max_length=128)],
         site_id: Annotated[str, Form(alias="siteId", min_length=1, max_length=64)],
+        video_id: Annotated[str | None, Form(alias="videoId")] = None,
+        description: Annotated[str | None, Form()] = None,
     ) -> JSONResponse:
+        if video_id is not None:
+            _require_registered_video(app.state.repository, video_id)
         if file.content_type not in ALLOWED_SCENE_MEDIA_TYPES:
-            raise ApiError("WE0101", "scene file must be PNG or JPEG")
+            raise ApiError("WE0101", "scene file must be PNG or JPEG",
+                           status_code=422 if video_id is not None else 400)
         content = await file.read(MAX_SCENE_FILE_BYTES + 1)
         if len(content) > MAX_SCENE_FILE_BYTES:
-            raise ApiError("WE0101", "scene file exceeds 20 MB")
+            raise ApiError("WE0101", "scene file exceeds 20 MB",
+                           status_code=422 if video_id is not None else 400)
+        if not content:
+            raise ApiError("WE0101", "scene file must not be empty", status_code=422)
         image = cv2.imdecode(np.frombuffer(content, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
         if image is None:
-            raise ApiError("WE0101", "scene file is not a valid image")
+            raise ApiError("WE0101", "scene file is not a valid image",
+                           status_code=422 if video_id is not None else 400)
         height, width = image.shape[:2]
         scene_id = _new_id("scene")
         scene = SceneRecord(
@@ -179,6 +294,8 @@ def create_app(
             height=int(height),
             media_type=file.content_type,
             content=content,
+            video_id=video_id,
+            description=description,
         )
         app.state.repository.add_scene(scene)
         return JSONResponse(
@@ -187,6 +304,9 @@ def create_app(
                 request,
                 data={
                     "sceneId": scene.scene_id,
+                    "sceneName": scene.scene_name,
+                    "videoId": scene.video_id,
+                    "sha256": sha256(content).hexdigest(),
                     "imageUrl": scene.image_url,
                     "width": scene.width,
                     "height": scene.height,
@@ -207,7 +327,20 @@ def create_app(
     ) -> JSONResponse:
         scene = app.state.repository.get_scene(body.scene_id)
         if scene is None or scene.analysis_id is not None:
-            raise ApiError("WE0101", f"unknown sceneId: {body.scene_id}")
+            raise ApiError("WE0101", f"unknown sceneId: {body.scene_id}",
+                           status_code=404 if body.video_id is not None else 400)
+        if body.video_id is not None:
+            video = _require_registered_video(app.state.repository, body.video_id)
+            if scene.video_id != video.video_id:
+                raise ApiError("WE0202", "sceneId is not bound to this videoId", status_code=409)
+            if video.camera_id != body.camera_id:
+                raise ApiError("WE0201", "video cameraId does not match configuration", status_code=422)
+            if any(not (0 <= pair.camera_point.x <= video.width
+                        and 0 <= pair.camera_point.y <= video.height)
+                   for pair in body.feature_pairs):
+                raise ApiError("WE0102", "calibration points must lie within the video frame", status_code=422)
+        elif scene.video_id is not None:
+            raise ApiError("WE0202", "video-bound scene requires videoId", status_code=409)
         try:
             areas = tuple(
                 WorkArea(
@@ -259,6 +392,8 @@ def create_app(
         ]
         data = {
             "configurationId": configuration_id,
+            "cameraId": body.camera_id,
+            "videoId": body.video_id,
             "calibrationVersion": calibration_version,
             "areaVersion": area_version,
             "quality": {
@@ -268,11 +403,16 @@ def create_app(
             "effectiveAreas": effective_areas,
             "status": "ACTIVE",
         }
-        app.state.repository.add_configuration(
+        save_configuration = (
+            app.state.repository.add_historical_configuration
+            if body.video_id is not None else app.state.repository.add_configuration
+        )
+        save_configuration(
             ConfigurationRecord(
                 configuration_id=configuration_id,
                 calibration_version=calibration_version,
                 area_version=area_version,
+                configuration_type="HISTORICAL" if body.video_id is not None else "REALTIME",
                 payload={
                     "request": body.model_dump(by_alias=True),
                     "homography": calibration.homography,
@@ -280,7 +420,20 @@ def create_app(
                 },
             )
         )
-        return JSONResponse(status_code=201, content=_envelope(request, data=data))
+        return JSONResponse(status_code=200 if body.video_id else 201,
+                            content=_envelope(request, data=data))
+
+    @app.get("/api/work-efficiency/v1/configurations/{configuration_id}", dependencies=[Depends(authorize)])
+    async def get_configuration(request: Request, configuration_id: str) -> JSONResponse:
+        configuration = app.state.repository.get_configuration(configuration_id)
+        if configuration is None:
+            raise ApiError("WE0201", "configuration is not available", status_code=404)
+        scene = app.state.repository.get_scene(configuration.payload["request"].get("sceneId", ""))
+        return JSONResponse(content=_envelope(request, data={
+            "configurationId": configuration_id,
+            **configuration.payload["response"], "request": configuration.payload["request"],
+            "sceneImageUrl": scene.image_url if scene is not None else None,
+        }))
 
     @app.post(
         "/api/work-efficiency/v1/historical-analyses",
@@ -581,9 +734,16 @@ def create_app(
             created_at=now,
             updated_at=now,
             analysis_id=analysis_id,
+            configuration_snapshot=deepcopy(configuration),
+            recording_started_at=(
+                body.recording_started_at.isoformat()
+                if body is not None and body.recording_started_at is not None else None
+            ),
         )
         try:
             app.state.repository.add_historical_task(analysis_id, task, updated_at=now)
+        except TaskConflictError as error:
+            raise ApiError("WE0203", str(error), status_code=409) from error
         except ValueError as error:
             raise ApiError("WE0202", str(error), status_code=409) from error
         if app.state.task_manager is not None:
@@ -612,28 +772,42 @@ def create_app(
     async def create_task(request: Request, body: TaskCreateRequest) -> JSONResponse:
         _validate_task_input(body)
         configuration = app.state.repository.get_configuration(body.configuration_id)
-        if configuration is None or configuration.configuration_type != "REALTIME":
+        realtime = body.input_type == "CAMERA_STREAM"
+        if (configuration is None
+                or configuration.payload.get("response", {}).get("status", "ACTIVE") != "ACTIVE"
+                or (realtime and (configuration.configuration_type != "REALTIME"
+                                 or configuration.analysis_id is not None))):
             raise ApiError(
-                "WE0202", f"realtime configuration is not active: {body.configuration_id}"
+                "WE0202", f"configuration is not active for {body.input_type}: {body.configuration_id}",
+                status_code=409 if body.input_type == "VIDEO_FILE" else 400,
             )
         _validate_task_resource(app.state.repository, body, configuration)
+        recording_started_at = None
+        if not realtime:
+            video = _require_registered_video(app.state.repository, body.video_id or "")
+            recording_started_at = _resolve_recording_start(body.recording_started_at, video)
         now = _timestamp()
         task = TaskRecord(
             task_id=_new_id("task"),
             input_type=body.input_type,
-            camera_id=body.camera_id,
+            camera_id=configuration.payload["request"].get("cameraId"),
             video_id=body.video_id,
             configuration_id=body.configuration_id,
             persist_pose_and_trajectory=body.options.persist_pose_and_trajectory,
             status=TaskStatus.CREATED,
             created_at=now,
             updated_at=now,
+            recording_started_at=recording_started_at,
+            configuration_snapshot=deepcopy(configuration),
         )
-        app.state.repository.add_task(task)
+        try:
+            app.state.repository.claim_task(task, task.camera_id or "")
+        except ValueError as error:
+            raise ApiError("WE0203", str(error), status_code=409) from error
         if app.state.task_manager is not None:
             task = app.state.task_manager.start(task.task_id)
         return JSONResponse(
-            status_code=201,
+            status_code=200 if body.input_type == "VIDEO_FILE" else 201,
             content=_envelope(request, data=_task_payload(task)),
         )
 
@@ -653,7 +827,9 @@ def create_app(
             else:
                 task = replace(task, status=TaskStatus.STOPPED, updated_at=_timestamp())
                 app.state.repository.update_task(task)
-        return JSONResponse(content=_envelope(request, data=_task_payload(task)))
+        data = _task_payload(task)
+        data["action"] = body.action
+        return JSONResponse(content=_envelope(request, data=data))
 
     @app.get(
         "/api/work-efficiency/v1/tasks/{task_id}/progress",
@@ -723,7 +899,7 @@ def create_app(
                 task
                 for task in app.state.repository.list_tasks()
                 if _datetime_epoch(start_time)
-                <= _datetime_epoch(datetime.fromisoformat(task.created_at))
+                <= _datetime_epoch(datetime.fromisoformat(task.recording_started_at or task.created_at))
                 <= _datetime_epoch(end_time)
             )
         items = []
@@ -825,6 +1001,10 @@ def _timestamp() -> str:
 
 
 def _validate_task_input(body: TaskCreateRequest) -> None:
+    if body.input_type == "VIDEO_FILE":
+        if body.video_id is None or body.camera_id is not None:
+            raise ApiError("WE0101", "VIDEO_FILE requires videoId and forbids cameraId", status_code=422)
+        return
     valid = body.camera_id is not None and body.video_id is None
     if not valid:
         raise ApiError(
@@ -838,6 +1018,11 @@ def _validate_task_resource(
     body: TaskCreateRequest,
     configuration: ConfigurationRecord,
 ) -> None:
+    if body.input_type == "VIDEO_FILE":
+        video = _require_registered_video(repository, body.video_id or "")
+        if not Path(video.path).is_file():
+            raise ApiError("WE0201", "registered video source is not readable", status_code=404)
+        return
     configured_camera_id = configuration.payload.get("request", {}).get("cameraId")
     camera = repository.get_camera(body.camera_id or "")
     if camera is None:
@@ -858,6 +1043,38 @@ def _validate_task_resource(
                 "suggestedAction": "RECALIBRATE",
             },
         )
+
+
+def _resolve_recording_start(value: datetime | None, video: VideoRecord) -> str:
+    if value is None and video.captured_at:
+        try:
+            value = datetime.fromisoformat(video.captured_at.replace("Z", "+00:00"))
+        except ValueError:
+            value = None
+    if value is None or value.utcoffset() is None:
+        raise ApiError("WE0101", "historical video requires recordingStartedAt with timezone",
+                       status_code=422)
+    return value.isoformat()
+
+
+def _require_registered_video(repository: InMemoryRepository, video_id: str) -> VideoRecord:
+    video = repository.get_video(video_id)
+    if video is None or video.analysis_id is not None:
+        raise ApiError("WE0201", f"videoId is not registered: {video_id}", status_code=404)
+    return video
+
+
+def _video_payload(video: VideoRecord, *, deduplicated: bool = False) -> dict:
+    return {
+        "videoId": video.video_id, "cameraId": video.camera_id,
+        "originalFileName": video.original_file_name, "contentType": "video/mp4",
+        "sizeBytes": video.size_bytes, "sha256": video.sha256,
+        "width": video.width, "height": video.height, "fps": video.fps,
+        "frameCount": video.frame_count, "durationSec": video.duration_sec,
+        "capturedAt": video.captured_at, "uploadedAt": video.uploaded_at,
+        "status": "READY", "deduplicated": deduplicated,
+        "previewUrl": f"/api/work-efficiency/v1/videos/{video.video_id}/preview",
+    }
 
 
 def _historical_video_payload(video: VideoRecord) -> dict:
@@ -1092,16 +1309,24 @@ def _task_payload(task: TaskRecord) -> dict:
         "cameraId": task.camera_id,
         "videoId": task.video_id,
         "configurationId": task.configuration_id,
-        "status": task.status.value,
+        "status": "QUEUED" if task.input_type == "VIDEO_FILE" and task.status in {
+            TaskStatus.CREATED, TaskStatus.STARTING
+        } else task.status.value,
         "options": {"persistPoseAndTrajectory": task.persist_pose_and_trajectory},
         "createdAt": task.created_at,
         "updatedAt": task.updated_at,
         "failureCode": task.failure_code,
         "failureMessage": task.failure_message,
         "analysisId": task.analysis_id,
+        "recordingStartedAt": task.recording_started_at,
     }
     if task.input_type == "HISTORICAL_VIDEO":
         payload["historicalConfigurationId"] = task.configuration_id
+    if task.configuration_snapshot is not None:
+        payload["configurationSnapshot"] = {
+            "configurationId": task.configuration_snapshot.configuration_id,
+            **deepcopy(task.configuration_snapshot.payload),
+        }
     return payload
 
 
@@ -1138,7 +1363,7 @@ def _source_time_iso(task: TaskRecord, frame: Any, source_timestamp_sec: float) 
     if frame.captured_at_sec is not None:
         epoch_sec = frame.captured_at_sec + source_timestamp_sec - frame.timestamp_sec
         return datetime.fromtimestamp(epoch_sec, timezone.utc).isoformat()
-    task_started = datetime.fromisoformat(task.created_at)
+    task_started = datetime.fromisoformat(task.recording_started_at or task.created_at)
     return (task_started + timedelta(seconds=source_timestamp_sec)).isoformat()
 
 

@@ -130,7 +130,7 @@ class JsonRepository(records.InMemoryRepository):
                 name: encode(getattr(self, name)) for name in _COLLECTIONS})
             for task in self._tasks.values():
                 directory = self.database.task_directory(task.task_id)
-                config = self.get_configuration(task.configuration_id)
+                config = task.configuration_snapshot or self.get_configuration(task.configuration_id)
                 video = self.get_video(task.video_id) if task.video_id else None
                 scene_id = None if config is None else config.payload.get("request", {}).get("sceneId")
                 if task.analysis_id and task.analysis_id in self._historical_analyses:
@@ -169,7 +169,7 @@ for _name in ("add_scene", "remove_scene", "add_video", "remove_video", "add_cam
               "add_configuration", "remove_configuration", "add_historical_configuration",
               "remove_historical_configuration", "add_historical_analysis",
               "update_historical_analysis", "add_historical_task", "add_task", "update_task",
-              "transition_task"):
+              "transition_task", "claim_task"):
     setattr(JsonRepository, _name, durable_mutation(getattr(records.InMemoryRepository, _name)))
 
 

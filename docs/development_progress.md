@@ -1,8 +1,20 @@
 # 施工人员工效智能感知后端开发进度
 
-> 更新日期：2026-09-02
+> 更新日期：2026-11-03
 > 对照文档：《施工人员工效智能感知功能及前后端接口规范-0825》  
 > 当前阶段：可供前端联调，尚未达到正式生产部署条件
+
+## 2026-11-03 历史视频流程与物料对齐
+
+当前标准调用为 `POST /videos → POST /scenes（videoId）→ POST /configurations（videoId）→ POST /tasks（VIDEO_FILE）`，分别取得 videoId、sceneId、configurationId、taskId。通过 `PATCH /tasks/{taskId}` 停止；全局单历史任务与实时相机任务分开调度；实时按相机互斥，历史停止中仍占名额，终态后可以新建任务从头分析。
+
+详见 [当前历史视频接口规范](history_video_api.md) 和 [本次修改记录](2026-11-03历史视频流程对齐记录.md)。旧 historical-analyses 路由保留兼容，0825/0902 Word 中的旧历史流程不作为新对接依据。默认入口已经使用本地 JSON 持久化。
+
+以下早期进度、完成比例及第 8 节的旧流程作为当时记录保留；涉及新对接时以上述规范和当前 OpenAPI 为准。
+
+### 同日追加配置复用与录像时间对齐
+
+历史 VIDEO_FILE 任务现允许选择已有相机/其他视频配置，省略新场景和新配置步骤；新建专属配置的绑定校验仍保留。启动时间优先 recordingStartedAt，再取视频 capturedAt，必须有效且带时区。新实时与历史任务保存并执行独立配置快照。旧 historical-analyses 的录像时间仍按兼容规则处理。详见当前接口规范和第三轮修改记录。
 
 ## 2026-10-31 班组连续计工更新
 
@@ -301,8 +313,8 @@ db/mysql_schema.sql
 
 1. 已增加历史分析记录及 `EMPTY/VIDEO_UPLOADED/ASSETS_READY/READY/LOCKED` 准备状态。
 2. 已增加独立的视频、场景图、代表帧、历史配置和任务启动接口。
-3. 已删除旧的 `/videos` 相机绑定上传及兼容实时配置查询接口。
-4. 通用 `/tasks` 创建接口现在只接受 `CAMERA_STREAM`。
+3. 当时删除了旧的 `/videos` 相机绑定上传；2026-11-03 已按物料协议重新提供，详见本文顶部更新。
+4. 当时通用 `/tasks` 只接受 `CAMERA_STREAM`；2026-11-03 起同时接受 `VIDEO_FILE`。
 5. 历史任务使用 `HISTORICAL_VIDEO`，并返回 `analysisId` 和 `historicalConfigurationId`。
 6. 任务状态、停止、进度、最新结果、工效汇总和 WebSocket 继续复用公共接口。
 7. 当前仍使用内存仓储；数据库结构和结果持久化等待数据库设计后实施。

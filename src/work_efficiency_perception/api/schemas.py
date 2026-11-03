@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class ApiModel(BaseModel):
@@ -49,6 +50,9 @@ class StorageRequest(ApiModel):
 
 class ConfigurationRequest(ApiModel):
     camera_id: Annotated[str, Field(min_length=1, max_length=64)] = Field(alias="cameraId")
+    video_id: Annotated[str | None, Field(min_length=1, max_length=64)] = Field(
+        default=None, alias="videoId"
+    )
     scene_id: Annotated[str, Field(min_length=1, max_length=64)] = Field(alias="sceneId")
     feature_pairs: Annotated[list[FeaturePairRequest], Field(min_length=4)] = Field(
         alias="featurePairs"
@@ -62,8 +66,19 @@ class TaskOptionsRequest(ApiModel):
     persist_pose_and_trajectory: bool = Field(default=True, alias="persistPoseAndTrajectory")
 
 
-class TaskCreateRequest(ApiModel):
-    input_type: Literal["CAMERA_STREAM"] = Field(alias="inputType")
+class RecordingStartRequest(ApiModel):
+    recording_started_at: datetime | None = Field(default=None, alias="recordingStartedAt")
+
+    @field_validator("recording_started_at")
+    @classmethod
+    def require_timezone(cls, value: datetime | None) -> datetime | None:
+        if value is not None and value.utcoffset() is None:
+            raise ValueError("recordingStartedAt requires a timezone")
+        return value
+
+
+class TaskCreateRequest(RecordingStartRequest):
+    input_type: Literal["CAMERA_STREAM", "VIDEO_FILE"] = Field(alias="inputType")
     camera_id: Annotated[str | None, Field(min_length=1, max_length=64)] = Field(
         default=None, alias="cameraId"
     )
@@ -97,7 +112,7 @@ class HistoricalConfigurationRequest(ApiModel):
     storage: StorageRequest = Field(default_factory=StorageRequest)
 
 
-class HistoricalTaskCreateRequest(ApiModel):
+class HistoricalTaskCreateRequest(RecordingStartRequest):
     options: TaskOptionsRequest = Field(default_factory=TaskOptionsRequest)
 
 

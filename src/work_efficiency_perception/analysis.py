@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from queue import Empty, Full, Queue
 from threading import Event, RLock
@@ -209,6 +210,17 @@ class MediaAnalysisWorker:
         frame: object,
         total_frames: int | None,
     ) -> None:
+        captured_at_sec = frame.captured_at_sec
+        if (task.input_type in {"VIDEO_FILE", "HISTORICAL_VIDEO"}
+                and task.recording_started_at is not None):
+            captured_at_sec = datetime.fromisoformat(task.recording_started_at).timestamp() + frame.timestamp_sec
+        elif captured_at_sec is None and task.video_id is not None:
+            video = self._repository.get_video(task.video_id)
+            if video is not None and video.captured_at is not None:
+                captured_at = datetime.fromisoformat(video.captured_at)
+                if captured_at.tzinfo is None:
+                    captured_at = captured_at.replace(tzinfo=timezone.utc)
+                captured_at_sec = captured_at.timestamp() + frame.timestamp_sec
         persons = tracker.track_frame(
             frame.image,
             frame_seq=frame.sequence,
@@ -232,7 +244,7 @@ class MediaAnalysisWorker:
                 frame.timestamp_sec,
                 progress,
                 persons,
-                frame.captured_at_sec,
+                captured_at_sec,
                 work_efficiency,
                 source.metadata.width,
                 source.metadata.height,

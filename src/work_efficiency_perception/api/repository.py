@@ -16,6 +16,8 @@ class SceneRecord:
     media_type: str
     content: bytes
     analysis_id: str | None = None
+    video_id: str | None = None
+    description: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,6 +31,11 @@ class VideoRecord:
     frame_count: int
     duration_sec: float
     analysis_id: str | None = None
+    original_file_name: str | None = None
+    size_bytes: int = 0
+    sha256: str | None = None
+    captured_at: str | None = None
+    uploaded_at: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,6 +87,10 @@ class TaskStatus(str, Enum):
 TERMINAL_TASK_STATUSES = {TaskStatus.STOPPED, TaskStatus.COMPLETED, TaskStatus.FAILED}
 
 
+class TaskConflictError(ValueError):
+    """A non-terminal task is holding the requested scheduling resource."""
+
+
 @dataclass(frozen=True, slots=True)
 class TaskRecord:
     task_id: str
@@ -94,6 +105,8 @@ class TaskRecord:
     failure_code: str | None = None
     failure_message: str | None = None
     analysis_id: str | None = None
+    recording_started_at: str | None = None
+    configuration_snapshot: ConfigurationRecord | None = None
 
 
 class InMemoryRepository:
@@ -128,6 +141,38 @@ class InMemoryRepository:
     def get_video(self, video_id: str) -> VideoRecord | None:
         with self._lock:
             return self._videos.get(video_id)
+
+    def list_videos(self) -> tuple[VideoRecord, ...]:
+        with self._lock:
+            return tuple(self._videos.values())
+
+    def claim_task(self, task: TaskRecord, camera_id: str) -> None:
+        """Reserve one historical slot or one live-camera slot atomically."""
+        with self._lock:
+            self._check_task_slot(task, camera_id)
+            if task.task_id in self._tasks:
+                raise ValueError(f"task already exists: {task.task_id}")
+            self._tasks[task.task_id] = task
+
+    def _check_task_slot(self, task: TaskRecord, camera_id: str | None = None) -> None:
+        historical_types = {"VIDEO_FILE", "HISTORICAL_VIDEO"}
+        historical = task.input_type in historical_types
+        for existing in self._tasks.values():
+            if existing.status in TERMINAL_TASK_STATUSES:
+                continue
+            existing_historical = existing.input_type in historical_types
+            if historical and existing_historical:
+                raise TaskConflictError(
+                    "another historical analysis task is running or stopping; "
+                    "only one historical task is allowed"
+                )
+            if not historical and not existing_historical:
+                config = self.get_configuration(existing.configuration_id)
+                existing_camera = existing.camera_id or (
+                    config.payload.get("request", {}).get("cameraId") if config is not None else None
+                )
+                if existing_camera == camera_id:
+                    raise TaskConflictError("another realtime task is already running for this camera")
 
     def remove_video(self, video_id: str) -> None:
         with self._lock:
@@ -233,6 +278,7 @@ class InMemoryRepository:
                 raise ValueError("historical analysis is not ready")
             if task.task_id in self._tasks:
                 raise ValueError(f"task already exists: {task.task_id}")
+            self._check_task_slot(task)
             self._tasks[task.task_id] = task
             updated = replace(
                 analysis,

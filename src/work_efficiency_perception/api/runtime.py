@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
+from copy import deepcopy
 from dataclasses import dataclass
 from threading import Event, RLock
 from typing import Protocol
@@ -62,7 +63,9 @@ class TaskManager:
             if current is None:
                 raise KeyError(task_id)
             return current
-        configuration = self._repository.get_configuration(task.configuration_id)
+        configuration = task.configuration_snapshot or self._repository.get_configuration(
+            task.configuration_id
+        )
         if configuration is None:
             failed = self._repository.transition_task(
                 task_id,
@@ -73,6 +76,9 @@ class TaskManager:
                 failure_message="configuration disappeared before task start",
             )
             return failed or task
+
+        # Workers get their own copy; neither the registry nor the archived snapshot can change it.
+        configuration = deepcopy(configuration)
 
         stop_event = Event()
         with self._lock:

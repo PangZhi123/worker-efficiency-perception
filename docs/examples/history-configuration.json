@@ -1,0 +1,20 @@
+{
+  "cameraId": "cam_01",
+  "videoId": "替换为上传返回的videoId",
+  "sceneId": "替换为场景上传返回的sceneId",
+  "featurePairs": [
+    {"cameraPoint": {"x": 0, "y": 0}, "scenePoint": {"x": 0, "y": 0}},
+    {"cameraPoint": {"x": 1920, "y": 0}, "scenePoint": {"x": 1000, "y": 0}},
+    {"cameraPoint": {"x": 1920, "y": 1080}, "scenePoint": {"x": 1000, "y": 500}},
+    {"cameraPoint": {"x": 0, "y": 1080}, "scenePoint": {"x": 0, "y": 500}}
+  ],
+  "workAreas": [{
+    "areaId": "area_1",
+    "coordinateType": "NORMALIZED",
+    "polygon": [{"x": 0, "y": 0}, {"x": 1, "y": 0}, {"x": 1, "y": 1}, {"x": 0, "y": 1}],
+    "expectedWorkerCount": 5,
+    "requiredTeamWorkDurationSec": 300
+  }],
+  "algorithm": {"personConfidence": 0.5, "entryDetectionDurationSec": 3, "exitDetectionDurationSec": 5},
+  "storage": {"poseSamplingMs": 1000}
+}

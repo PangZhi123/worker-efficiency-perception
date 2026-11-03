@@ -46,13 +46,19 @@ $env:WORK_EFFICIENCY_DEVICE = "0"
 $env:WORK_EFFICIENCY_IMAGE_SIZE = "1280"
 ```
 
+历史视频自 2026-11-03 起按物料流程对接：`上传视频 → videoId → 选择已有配置或新建配置 → configurationId + 带时区的录像开始时间 → 创建 VIDEO_FILE 任务 → taskId → 查询或停止`。详见 [历史视频接口规范](docs/history_video_api.md)、[1103 Word 规范](docs/施工人员工效智能感知历史视频接口规范-1103.docx)、[修改记录](docs/2026-11-03历史视频流程对齐记录.md)。0825/0902 Word 的历史流程保留为旧版资料，以本次规范为准。
+
 当前已提供：
 
 - `GET /health`：健康检查；
-- `POST /api/work-efficiency/v1/scenes`：上传实时分析使用的 PNG/JPEG 场景图；
+- `POST /api/work-efficiency/v1/videos`：multipart 上传录像（file、cameraId、可选 capturedAt），返回 videoId；
+- `GET /api/work-efficiency/v1/videos`：列出已登记录像；
+- `GET /api/work-efficiency/v1/videos/{videoId}`：读取录像信息；
+- `GET /api/work-efficiency/v1/videos/{videoId}/preview`：读取代表帧；
+- `POST /api/work-efficiency/v1/scenes`：上传 PNG/JPEG 场景图，历史模式携带 videoId；
 - `GET /files/scenes/{sceneId}`：读取已上传的场景图；
-- `POST /api/work-efficiency/v1/configurations`：提交实时相机标定和工作区配置；
-- `POST /api/work-efficiency/v1/historical-analyses`：创建独立历史分析记录；
+- `POST /api/work-efficiency/v1/configurations`：提交相机或 videoId 专属的标定和工作区配置；
+- `POST /api/work-efficiency/v1/historical-analyses`：创建独立历史分析记录（旧接口兼容，新对接不使用）；
 - `GET /api/work-efficiency/v1/historical-analyses/{analysisId}`：查询历史分析准备状态；
 - `POST /api/work-efficiency/v1/historical-analyses/{analysisId}/video`：上传专属历史 MP4；
 - `POST /api/work-efficiency/v1/historical-analyses/{analysisId}/scene`：上传专属场景图；
@@ -60,7 +66,7 @@ $env:WORK_EFFICIENCY_IMAGE_SIZE = "1280"
 - `PUT /api/work-efficiency/v1/historical-analyses/{analysisId}/configuration`：保存历史标定和区域配置；
 - `POST /api/work-efficiency/v1/historical-analyses/{analysisId}/tasks`：启动或重试历史任务；
 - `POST /api/work-efficiency/v1/cameras`：登记实时 RTSP/RTMP 地址；
-- `POST /api/work-efficiency/v1/tasks`：创建实时相机任务；
+- `POST /api/work-efficiency/v1/tasks`：创建 CAMERA_STREAM 或 VIDEO_FILE 任务，历史模式传 videoId + configurationId，并确保有效的录像开始时间；
 - `GET /api/work-efficiency/v1/tasks/{taskId}`：查询任务状态；
 - `PATCH /api/work-efficiency/v1/tasks/{taskId}`：使用 `{"action":"STOP"}` 幂等停止任务。
 - `GET /api/work-efficiency/v1/tasks/{taskId}/progress`：查询处理进度；
@@ -70,7 +76,7 @@ $env:WORK_EFFICIENCY_IMAGE_SIZE = "1280"
 
 默认启动入口现已使用本地 JSON 文件 保存场景、配置、任务和分析结果，服务重启后可查询。模型文件存在时任务会自动进入后台分析；模型未配置时任务保持 `CREATED`。MySQL 仓储仍待接入。
 
-实时分析和历史视频分析使用独立的资源与配置流程。第一版每个历史分析记录包含一个视频、一张专属场景图和一套历史配置；任务启动后输入和配置锁定。历史视频默认按 200 ms 间隔抽帧推理（最高约 5 FPS），并始终分析首帧和末帧；实时流继续采用只保留最新帧的自适应丢帧策略。进度接口中的 `processedFrames` 表示已解码到的原始帧位置，`analyzedFrames` 表示实际执行模型推理的帧数。
+实时与历史复用场景、配置和任务接口，通过 videoId 登记历史素材；历史任务允许选择已有相机或其他视频配置，创建时保存独立配置快照。录像时间优先取 recordingStartedAt，未传则使用视频 capturedAt，必须有效且带时区。新 VIDEO_FILE 任务停止、失败或完成后均可创建新 taskId 从头分析。全局最多运行一个历史任务，实时与历史任务可并行；实时任务按相机互斥。历史任务停止中仍占用历史名额，需等待终态。旧 historical-analyses 继续保持输入锁定规则。历史视频默认按 200 ms 间隔抽帧推理（最高约 5 FPS），并始终分析首帧和末帧；实时流继续采用只保留最新帧的自适应丢帧策略。进度接口中的 `processedFrames` 表示已解码到的原始帧位置，`analyzedFrames` 表示实际执行模型推理的帧数。
 
 MySQL 8 初版表结构位于 `db/mysql_schema.sql`，正式数据库连接参数确认后再实现持久化仓储。
 
@@ -100,9 +106,9 @@ python -m uvicorn work_efficiency_perception.main:app --host 127.0.0.1 --port 80
 
 打开 http://127.0.0.1:8000/test-ui/ 。页面与 API 同源，无需 Node 或额外前端依赖。启用鉴权时在页面填写 Bearer Token。
 
-推荐先测“历史分析”：新建记录，上传 `cam1_5min_clip.mp4`，上传对应场景图；在两张图片上按同一顺序点击至少四对不共线的对应点；切换到绘制区域模式，在右图点击至少三个顶点并完成区域；保存配置，再启动分析。结果查询页支持进度、最新人员数据、区域工效、自动刷新、停止任务和 JSON 下载。没有现场相机也能完成此流程。
+推荐先测“历史分析”：填写来源相机 ID，上传 `cam1_5min_clip.mp4` 取得 videoId，选择已有 configurationId 并点击“读取所选配置”，或上传对应场景图后在两张图片上按同一顺序点击至少四对不共线的对应点；切换到绘制区域模式，在右图点击至少三个顶点并完成区域；新建配置需要保存；填写带时区的录像开始时间（或使用视频已有 capturedAt）后启动分析。结果查询页支持进度、最新人员数据、区域工效、自动刷新、停止任务和 JSON 下载。没有现场相机也能完成此流程。
 
-相机管理仅提供登记入口；实时分析通过可编辑 JSON 提交相机配置并启动任务；场景管理支持上传和预览实时场景图。实时 JSON 初始坐标只是结构示例，需改为实际画面与场景对应坐标。页面不是完整的生产管理系统，人员结果以 JSON 展示，不包含历史轨迹回放。已有记录可以按 analysisId 读取素材和状态，画布编辑点不会从旧配置自动恢复。默认启动入口会保存记录到本地 JSON 文件。
+相机管理仅提供登记入口；实时分析通过可编辑 JSON 提交相机配置并启动任务；场景管理支持上传和预览实时场景图。实时 JSON 初始坐标只是结构示例，需改为实际画面与场景对应坐标。页面不是完整的生产管理系统，人员结果以 JSON 展示，不包含历史轨迹回放。已有素材可按 videoId 和 configurationId 读取，画布编辑点不会从已有配置自动恢复。旧 analysisId 记录仍可通过兼容接口查询。默认启动入口会保存记录到本地 JSON 文件。
 
 ## 本地结果持久化（JSON 文件）
 
