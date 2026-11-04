@@ -169,7 +169,7 @@ for _name in ("add_scene", "remove_scene", "add_video", "remove_video", "add_cam
               "add_configuration", "remove_configuration", "add_historical_configuration",
               "remove_historical_configuration", "add_historical_analysis",
               "update_historical_analysis", "add_historical_task", "add_task", "update_task",
-              "transition_task", "claim_task"):
+              "transition_task", "claim_task", "remove_camera", "delete_configuration"):
     setattr(JsonRepository, _name, durable_mutation(getattr(records.InMemoryRepository, _name)))
 
 

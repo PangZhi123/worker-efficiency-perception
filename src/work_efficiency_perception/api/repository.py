@@ -186,6 +186,27 @@ class InMemoryRepository:
         with self._lock:
             return self._cameras.get(camera_id)
 
+    def list_cameras(self) -> tuple[CameraRecord, ...]:
+        with self._lock:
+            return tuple(self._cameras.values())
+
+    def remove_camera(self, camera_id: str) -> None:
+        with self._lock:
+            if any(t.camera_id == camera_id and t.input_type == "CAMERA_STREAM"
+                   and t.status not in TERMINAL_TASK_STATUSES for t in self._tasks.values()):
+                raise TaskConflictError("stop the camera task before deleting its registration")
+            self._cameras.pop(camera_id, None)
+
+    def delete_configuration(self, configuration_id: str) -> None:
+        with self._lock:
+            for collection in (self._configurations, self._historical_configurations):
+                record = collection.get(configuration_id)
+                if record is not None:
+                    from copy import deepcopy
+                    payload = deepcopy(record.payload)
+                    payload.setdefault("response", {})["status"] = "DELETED"
+                    collection[configuration_id] = replace(record, payload=payload)
+
     def add_configuration(self, configuration: ConfigurationRecord) -> None:
         if configuration.configuration_type != "REALTIME":
             raise ValueError("realtime configuration repository only accepts REALTIME")
@@ -201,7 +222,9 @@ class InMemoryRepository:
 
     def list_configurations(self) -> tuple[ConfigurationRecord, ...]:
         with self._lock:
-            return tuple(self._configurations.values())
+            return tuple(c for c in (*self._configurations.values(),
+                                     *self._historical_configurations.values())
+                         if c.payload.get("response", {}).get("status") != "DELETED")
 
     def remove_configuration(self, configuration_id: str) -> None:
         with self._lock:

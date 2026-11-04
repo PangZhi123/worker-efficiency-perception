@@ -654,3 +654,104 @@ def test_websocket_requires_configured_bearer_token():
     ):
         pass
     assert error.value.code == 4401
+
+
+@pytest.mark.parametrize("status", ["COMPLETED", "STOPPED", "FAILED"])
+@pytest.mark.parametrize("has_frame", [False, True])
+def test_websocket_terminal_status_and_normal_close(status, has_frame):
+    from work_efficiency_perception.api.repository import TaskRecord, TaskStatus
+    app = create_app()
+    task = TaskRecord("terminal", "CAMERA_STREAM", "cam", None, "cfg", True,
+                      TaskStatus(status), "2026-11-04T00:00:00+00:00",
+                      "2026-11-04T00:01:00+00:00", failure_code="WE0301",
+                      failure_message="model failed")
+    app.state.repository.add_task(task)
+    if has_frame:
+        app.state.analysis_result_store.update(task.task_id,
+            FrameAnalysisResult(5, 1., 1., (), work_efficiency={"persons": [], "areas": []}))
+    with TestClient(app) as client, client.websocket_connect(
+        "/ws/work-efficiency/v1/tasks/terminal"
+    ) as ws:
+        if has_frame:
+            assert ws.receive_json()["type"] == "FRAME_RESULT"
+        if status == "FAILED":
+            assert ws.receive_json()["type"] == "ERROR"
+        message = ws.receive_json()
+        assert message == {"type": "TASK_STATUS", "taskId": "terminal",
+            "taskStatus": status, "endedAt": task.updated_at,
+            "error": {"code": "WE0301", "message": "model failed"} if status == "FAILED" else None}
+        with pytest.raises(WebSocketDisconnect) as error:
+            ws.receive_json()
+        assert error.value.code == 1000
+
+
+def test_resource_lists_and_deletion_survive_restart(tmp_path):
+    from work_efficiency_perception.persistence import JsonArchive, JsonRepository
+    repository = JsonRepository(JsonArchive(tmp_path / "archive"))
+    with TestClient(create_app(repository=repository)) as client:
+        register_camera(client)
+        cfg = create_configuration(client)
+        assert client.get("/api/work-efficiency/v1/cameras").json()["data"]["items"] == [
+            {"cameraId": "cam_01", "status": "REGISTERED"}]
+        assert client.get("/api/work-efficiency/v1/configurations").json()["data"]["items"][0]["configurationId"] == cfg
+    restored = JsonRepository(JsonArchive(tmp_path / "archive"))
+    with TestClient(create_app(repository=restored)) as client:
+        assert restored.get_camera("cam_01") is not None
+        assert client.get(f"/api/work-efficiency/v1/configurations/{cfg}").status_code == 200
+        assert client.delete("/api/work-efficiency/v1/cameras/cam_01").status_code == 200
+        assert client.delete(f"/api/work-efficiency/v1/configurations/{cfg}").status_code == 200
+    restored = JsonRepository(JsonArchive(tmp_path / "archive"))
+    with TestClient(create_app(repository=restored)) as client:
+        assert client.get("/api/work-efficiency/v1/cameras").json()["data"]["items"] == []
+        assert client.get("/api/work-efficiency/v1/configurations").json()["data"]["items"] == []
+        assert client.get(f"/api/work-efficiency/v1/configurations/{cfg}").status_code == 404
+        assert restored.get_configuration(cfg).payload["response"]["status"] == "DELETED"
+        register_camera(client)
+        response = client.post("/api/work-efficiency/v1/tasks", json={
+            "inputType": "CAMERA_STREAM", "cameraId": "cam_01", "configurationId": cfg})
+        assert response.json()["code"] == "WE0202"
+
+
+def test_running_camera_delete_conflict_and_configuration_snapshot():
+    app = create_app()
+    with TestClient(app) as client:
+        register_camera(client)
+        cfg = create_configuration(client)
+        task = client.post("/api/work-efficiency/v1/tasks", json={
+            "inputType": "CAMERA_STREAM", "cameraId": "cam_01", "configurationId": cfg}).json()["data"]
+        assert client.delete("/api/work-efficiency/v1/cameras/cam_01").status_code == 409
+        assert client.delete(f"/api/work-efficiency/v1/configurations/{cfg}").status_code == 200
+        snapshot = app.state.repository.get_task(task["taskId"]).configuration_snapshot
+        assert snapshot.payload["response"]["status"] != "DELETED"
+        client.patch(f"/api/work-efficiency/v1/tasks/{task['taskId']}", json={"action": "STOP"})
+        assert client.delete("/api/work-efficiency/v1/cameras/cam_01").status_code == 200
+
+
+def test_resource_management_requires_auth():
+    with TestClient(create_app(bearer_token="secret")) as client:
+        for path in ("cameras", "configurations"):
+            assert client.get(f"/api/work-efficiency/v1/{path}").status_code == 401
+            assert client.delete(f"/api/work-efficiency/v1/{path}/missing").status_code == 401
+
+
+def test_websocket_running_task_sends_last_frame_before_terminal():
+    from dataclasses import replace
+    from work_efficiency_perception.api.repository import TaskRecord, TaskStatus
+    app = create_app()
+    task = TaskRecord("finishing", "CAMERA_STREAM", "cam", None, "cfg", True,
+                      TaskStatus.RUNNING, "2026-11-04T00:00:00+00:00",
+                      "2026-11-04T00:00:00+00:00")
+    app.state.repository.add_task(task)
+    with TestClient(app) as client, client.websocket_connect(
+        "/ws/work-efficiency/v1/tasks/finishing"
+    ) as ws:
+        app.state.analysis_result_store.update(task.task_id,
+            FrameAnalysisResult(7, 2., 1., (), work_efficiency={"persons": [], "areas": []}))
+        app.state.repository.update_task(replace(task, status=TaskStatus.COMPLETED))
+        frame = ws.receive_json()
+        assert frame["type"] == "FRAME_RESULT"
+        assert frame["frame"]["seq"] == 7
+        assert ws.receive_json()["taskStatus"] == "COMPLETED"
+        with pytest.raises(WebSocketDisconnect) as error:
+            ws.receive_json()
+        assert error.value.code == 1000

@@ -423,10 +423,40 @@ def create_app(
         return JSONResponse(status_code=200 if body.video_id else 201,
                             content=_envelope(request, data=data))
 
+    @app.get("/api/work-efficiency/v1/cameras", dependencies=[Depends(authorize)])
+    async def list_cameras(request: Request) -> JSONResponse:
+        return JSONResponse(content=_envelope(request, data={"items": [
+            {"cameraId": c.camera_id, "status": "REGISTERED"}
+            for c in app.state.repository.list_cameras()
+        ]}))
+
+    @app.delete("/api/work-efficiency/v1/cameras/{camera_id}", dependencies=[Depends(authorize)])
+    async def delete_camera(request: Request, camera_id: str) -> JSONResponse:
+        try:
+            app.state.repository.remove_camera(camera_id)
+        except TaskConflictError as error:
+            raise ApiError("WE0203", str(error), status_code=409) from error
+        return JSONResponse(content=_envelope(request, data={"cameraId": camera_id, "status": "DELETED"}))
+
+    @app.get("/api/work-efficiency/v1/configurations", dependencies=[Depends(authorize)])
+    async def list_configurations(request: Request) -> JSONResponse:
+        return JSONResponse(content=_envelope(request, data={"items": [
+            {"configurationId": c.configuration_id, "configurationType": c.configuration_type,
+             "cameraId": c.payload.get("request", {}).get("cameraId"),
+             "sceneId": c.payload.get("request", {}).get("sceneId"),
+             "analysisId": c.analysis_id}
+            for c in app.state.repository.list_configurations()
+        ]}))
+
+    @app.delete("/api/work-efficiency/v1/configurations/{configuration_id}", dependencies=[Depends(authorize)])
+    async def delete_configuration(request: Request, configuration_id: str) -> JSONResponse:
+        app.state.repository.delete_configuration(configuration_id)
+        return JSONResponse(content=_envelope(request, data={"configurationId": configuration_id, "status": "DELETED"}))
+
     @app.get("/api/work-efficiency/v1/configurations/{configuration_id}", dependencies=[Depends(authorize)])
     async def get_configuration(request: Request, configuration_id: str) -> JSONResponse:
         configuration = app.state.repository.get_configuration(configuration_id)
-        if configuration is None:
+        if configuration is None or configuration.payload.get("response", {}).get("status") == "DELETED":
             raise ApiError("WE0201", "configuration is not available", status_code=404)
         scene = app.state.repository.get_scene(configuration.payload["request"].get("sceneId", ""))
         return JSONResponse(content=_envelope(request, data={
@@ -709,6 +739,7 @@ def create_app(
             missing.append("SCENE")
         if (
             configuration is None
+            or configuration.payload.get("response", {}).get("status") == "DELETED"
             or configuration.configuration_type != "HISTORICAL"
             or configuration.analysis_id != analysis_id
         ):
@@ -968,17 +999,22 @@ def create_app(
                         {"type": "ERROR", "taskId": task_id, "code": "WE0201", "message": "task not found"}
                     )
                     break
-                if task.status == TaskStatus.FAILED:
-                    await websocket.send_json(
-                        {
-                            "type": "ERROR",
-                            "taskId": task_id,
-                            "code": task.failure_code or "WE0301",
-                            "message": task.failure_message or "analysis failed",
-                        }
-                    )
-                    break
                 if task.status in TERMINAL_TASK_STATUSES:
+                    # Terminal status is committed after the final result. Read the
+                    # snapshot again so a simultaneous completion cannot skip it.
+                    latest = app.state.analysis_result_store.get(task_id).latest_frame
+                    if latest is not None and latest.frame_seq > last_sequence:
+                        await websocket.send_json(_websocket_frame_payload(task, latest))
+                    if task.status == TaskStatus.FAILED:
+                        await websocket.send_json({"type": "ERROR", "taskId": task_id,
+                            "code": task.failure_code or "WE0301",
+                            "message": task.failure_message or "analysis failed"})
+                    await websocket.send_json({"type": "TASK_STATUS", "taskId": task_id,
+                        "taskStatus": task.status.value, "endedAt": task.updated_at,
+                        "error": None if task.status != TaskStatus.FAILED else {
+                            "code": task.failure_code or "WE0301",
+                            "message": task.failure_message or "analysis failed"}})
+                    await websocket.close(code=1000)
                     break
         except WebSocketDisconnect:
             pass
