@@ -322,7 +322,7 @@ def test_legacy_history_returns_slot_conflict_and_releases_after_stop(tmp_path):
 def test_new_history_can_select_legacy_configuration_without_camera_id(tmp_path):
     client = TestClient(create_app(video_directory=tmp_path / "uploads"))
     prepared = prepare_historical_analysis(client, tmp_path)
-    video = client.post("/api/work-efficiency/v1/videos", data={"cameraId": "cam_source"},
+    video = client.post("/api/work-efficiency/v1/videos",
         files={"file": ("source.mp4", (tmp_path / "source.mp4").read_bytes(), "video/mp4")})
     response = client.post("/api/work-efficiency/v1/tasks", json={
         "inputType": "VIDEO_FILE", "videoId": video.json()["data"]["videoId"],

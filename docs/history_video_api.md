@@ -1,6 +1,6 @@
 # 历史视频上传与分析接口
 
-更新日期：2026-11-03。历史视频流程以物料工程现有 `/videos → /scenes → /configurations → /tasks` 实现为基准。本文替代 0902 Word 文档第 14 节作为历史视频的新对接说明；旧 `historical-analyses` 接口暂时保留兼容。
+更新日期：2026-11-06。历史视频流程以物料工程现有 `/videos → /scenes → /configurations → /tasks` 实现为基准。本文替代 0902 Word 文档第 14 节作为历史视频的新对接说明；旧 `historical-analyses` 接口暂时保留兼容。
 
 接口前缀为 `/api/work-efficiency/v1`，工效配置、算法、结果字段与物料各自独立。历史视频无需调用方创建或传递 `analysisId`。Swagger 位于 `/docs`，OpenAPI 位于 `/openapi.json`。
 
@@ -12,7 +12,7 @@
 4. 用 videoId + configurationId 创建 VIDEO_FILE 任务，取得 taskId。
 5. 用 taskId 查询状态、进度和工效结果，或请求停止。
 
-历史任务按调用方选择的配置版本分析，不再要求配置绑定同一个 videoId，也不再要求配置 cameraId 与录像来源一致。选择已有配置时，须根据实际画面确认标定、区域和视频视角适用；本次不自动缩放或重新标定。
+历史任务按调用方选择的配置版本分析，不再要求配置绑定同一个 videoId，上传录像无需 cameraId。选择已有配置时，须根据实际画面确认标定、区域和视频视角适用；本次不自动缩放或重新标定。
 
 ## 上传视频
 
@@ -21,7 +21,6 @@
 | 字段 | 必填 | 说明 |
 | --- | --- | --- |
 | file | 是 | 可解码的 MP4 文件，文件名扩展名 `.mp4` |
-| cameraId | 是 | 来源相机标识，去除首尾空格后非空，最长 64 字符；不要求登记实时流或相机在线 |
 | capturedAt | 否 | ISO 8601 录像开始时间，例如 `2026-11-03T09:00:00+08:00`，建议携带时区 |
 
 文件部分接受 `video/mp4`、`application/mp4`、`application/octet-stream`。默认最大 5 GiB，可通过 `WORK_EFFICIENCY_MAX_VIDEO_BYTES` 修改字节数。反向代理的请求体限制和超时须另外配置。
@@ -30,7 +29,7 @@
 
 | 字段 | 说明 |
 | --- | --- |
-| videoId、cameraId | 视频标识和来源相机 |
+| videoId、cameraId | 视频标识；cameraId 为兼容字段，新上传视频为 null，旧记录保留原值 |
 | originalFileName、contentType | 文件名和规范化的 `video/mp4` |
 | sizeBytes、sha256 | 实际字节数和内容摘要 |
 | width、height、fps、frameCount、durationSec | 视频元数据 |
@@ -39,7 +38,7 @@
 | deduplicated | 是否命中已有内容 |
 | previewUrl | 工效测试工作台使用的代表帧接口 |
 
-同内容、同 cameraId 返回原 videoId；同内容、不同 cameraId 返回新 videoId，但复用磁盘文件。去重命中同一 videoId 时保留原登记元数据。空文件、无效 MP4、超过大小限制或登记失败会清理本次临时文件。
+按文件 SHA256 去重，同内容返回已有 videoId，不再按 cameraId 分别登记。去重命中同一 videoId 时保留原登记元数据。空文件、无效 MP4、超过大小限制或登记失败会清理本次临时文件。
 
 补充查询接口：
 
@@ -61,7 +60,7 @@
 
 | 字段 | 必填 | 说明 |
 | --- | --- | --- |
-| cameraId | 是 | 配置所属相机；新建视频专属配置时须与绑定视频一致 |
+| cameraId | 是 | 配置所属相机标识；无需与视频匹配，不参与视频上传 |
 | videoId | 否 | 新建视频专属配置时绑定视频；复用已有配置无需重新创建 |
 | sceneId | 是 | 新建视频专属配置时须绑定同一个 videoId；相机配置使用未绑定视频的场景 |
 | featurePairs | 是 | 至少四对不共线的 `{cameraPoint:{x,y}, scenePoint:{x,y}}` |
@@ -89,7 +88,7 @@
 }
 ```
 
-历史任务不传 cameraId。响应包括 taskId、inputType、videoId、configurationId、recordingStartedAt、status 等；返回的 cameraId 来自所选配置，可能与上传录像的来源 cameraId 不同。新协议不依赖 analysisId，该兼容字段可为 null。`options` 保留工效字段，不接受物料的 persistTrajectory/pushIntervalMs。
+历史任务不传 cameraId。响应包括 taskId、inputType、videoId、configurationId、recordingStartedAt、status 等；返回的 cameraId 来自所选配置，无需对应视频来源。新协议不依赖 analysisId，该兼容字段可为 null。`options` 保留工效字段，不接受物料的 persistTrajectory/pushIntervalMs。
 
 历史任务使用独立的全局分析名额，最多同时接受一个历史任务，新 VIDEO_FILE 和旧 HISTORICAL_VIDEO 共用此名额。实时任务继续按 cameraId 互斥；实时与历史任务可同时运行，即使来自同一 cameraId。历史名额被占用或同一相机已有实时任务时，返回 HTTP 409、WE0203，并说明冲突原因。线程池容量仍决定实际执行并发。同一视频停止、失败或完成后均可创建新任务，产生新 taskId，从头分析，不是断点续跑。重复停止终态任务不会改变终态和更新时间。
 
@@ -126,7 +125,7 @@ VIDEO_FILE 启动时优先使用 recordingStartedAt，未传则使用视频 capt
 
 ```powershell
 $base = 'http://127.0.0.1:8000/api/work-efficiency/v1'
-$video = (curl.exe -sS "$base/videos" -F 'file=@cam1_5min_clip.mp4;type=video/mp4' -F 'cameraId=cam_01' | ConvertFrom-Json).data
+$video = (curl.exe -sS "$base/videos" -F 'file=@cam1_5min_clip.mp4;type=video/mp4' | ConvertFrom-Json).data
 $scene = (curl.exe -sS "$base/scenes" -F 'file=@scene.png;type=image/png' -F 'sceneName=历史场景' -F 'siteId=site_01' -F "videoId=$($video.videoId)" | ConvertFrom-Json).data
 ```
 

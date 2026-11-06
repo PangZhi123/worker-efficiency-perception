@@ -168,12 +168,8 @@ def create_app(
     async def upload_video(
         request: Request,
         file: Annotated[UploadFile, File()],
-        camera_id: Annotated[str, Form(alias="cameraId", min_length=1, max_length=64)],
         captured_at: Annotated[str | None, Form(alias="capturedAt")] = None,
     ) -> JSONResponse:
-        camera_id = camera_id.strip()
-        if not camera_id:
-            raise ApiError("WE0101", "cameraId must not be blank", status_code=422)
         if captured_at is not None:
             try:
                 captured_at = datetime.fromisoformat(captured_at.replace("Z", "+00:00")).isoformat()
@@ -204,34 +200,26 @@ def create_app(
             matching = [v for v in app.state.repository.list_videos()
                         if v.analysis_id is None and v.sha256 == digest.hexdigest()
                         and Path(v.path).is_file()]
-            same_camera = next((v for v in matching if v.camera_id == camera_id), None)
-            if same_camera is not None:
+            if matching:
                 return JSONResponse(status_code=201, content=_envelope(
-                    request, data=_video_payload(same_camera, deduplicated=True)))
+                    request, data=_video_payload(matching[0], deduplicated=True)))
             video_id = _new_id("video")
-            if matching:
-                video = replace(matching[0], video_id=video_id, camera_id=camera_id,
-                                original_file_name=name, captured_at=captured_at,
-                                uploaded_at=_timestamp())
-            else:
-                from ..video import VideoFileSource
+            from ..video import VideoFileSource
 
-                with VideoFileSource(temporary) as source:
-                    metadata = source.metadata
-                    if not metadata.frame_count or next(iter(source), None) is None:
-                        raise ValueError("video has no decodable frames")
-                final_path = directory / f"{video_id}.mp4"
-                temporary.replace(final_path)
-                owned_path = final_path
-                video = VideoRecord(
-                    video_id, str(final_path), camera_id, metadata.width, metadata.height,
-                    metadata.fps, metadata.frame_count, metadata.duration_sec or 0.0,
-                    original_file_name=name, size_bytes=size, sha256=digest.hexdigest(),
-                    captured_at=captured_at, uploaded_at=_timestamp(),
-                )
+            with VideoFileSource(temporary) as source:
+                metadata = source.metadata
+                if not metadata.frame_count or next(iter(source), None) is None:
+                    raise ValueError("video has no decodable frames")
+            final_path = directory / f"{video_id}.mp4"
+            temporary.replace(final_path)
+            owned_path = final_path
+            video = VideoRecord(
+                video_id, str(final_path), None, metadata.width, metadata.height,
+                metadata.fps, metadata.frame_count, metadata.duration_sec or 0.0,
+                original_file_name=name, size_bytes=size, sha256=digest.hexdigest(),
+                captured_at=captured_at, uploaded_at=_timestamp(),
+            )
             app.state.repository.add_video(video)
-            if matching:
-                owned_path.unlink(missing_ok=True)
             owned_path = None
             return JSONResponse(status_code=201, content=_envelope(
                 request, data=_video_payload(video, deduplicated=bool(matching))))
@@ -333,8 +321,6 @@ def create_app(
             video = _require_registered_video(app.state.repository, body.video_id)
             if scene.video_id != video.video_id:
                 raise ApiError("WE0202", "sceneId is not bound to this videoId", status_code=409)
-            if video.camera_id != body.camera_id:
-                raise ApiError("WE0201", "video cameraId does not match configuration", status_code=422)
             if any(not (0 <= pair.camera_point.x <= video.width
                         and 0 <= pair.camera_point.y <= video.height)
                    for pair in body.feature_pairs):

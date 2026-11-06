@@ -14,7 +14,7 @@
 
 ### 1. 相机管理
 
-登记 cameraId 与 RTSP/RTMP 视频流地址，为实时分析提供输入。历史视频上传时的 cameraId 用于登记录像来源，不要求实时相机在线。
+登记 cameraId 与 RTSP/RTMP 视频流地址，为实时分析提供输入。历史视频上传无需 cameraId，也不要求登记或连接实时相机。
 
 ### 2. 实时工效分析
 
@@ -137,7 +137,7 @@ python -m uvicorn work_efficiency_perception.main:app --host 127.0.0.1 --port 80
 
 | 操作 | 接口及关键输入 |
 | --- | --- |
-| 上传录像 | `POST /videos`：multipart file、cameraId，可选 capturedAt，返回 videoId |
+| 上传录像 | `POST /videos`：multipart file，可选 capturedAt，返回 videoId |
 | 读取视频 | `GET /videos`、`GET /videos/{videoId}`、`GET /videos/{videoId}/preview` |
 | 新建场景与配置 | `POST /scenes`、`POST /configurations`；已有配置可跳过此步骤 |
 | 读取已有配置 | `GET /configurations/{configurationId}` |

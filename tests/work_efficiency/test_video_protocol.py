@@ -28,9 +28,9 @@ def mp4(tmp_path):
     return path.read_bytes()
 
 
-def upload(client, content, camera="cam_01", **extra):
+def upload(client, content, **extra):
     return client.post(API + "/videos", files={"file": ("sample.mp4", content, "video/mp4")},
-                       data={"cameraId": camera, "capturedAt": "2026-11-03T01:00:00Z", **extra})
+                       data={"capturedAt": "2026-11-03T01:00:00Z", **extra})
 
 
 def configure(client, video, camera="cam_01"):
@@ -85,15 +85,22 @@ def test_upload_deduplication_and_resource_isolation(tmp_path, mp4):
     assert first.status_code == 201
     video = first.json()["data"]
     assert video["status"] == "READY"
+    assert video["cameraId"] is None
+    schema = client.get("/openapi.json").json()
+    content = schema["paths"][API + "/videos"]["post"]["requestBody"]["content"]
+    body = content["multipart/form-data"]["schema"]
+    properties = schema["components"]["schemas"][body["$ref"].split("/")[-1]]["properties"]
+    assert "cameraId" not in properties
     assert video["sizeBytes"] == len(mp4)
     assert len(video["sha256"]) == 64
-    duplicate = upload(client, mp4).json()["data"]
+    duplicate = upload(client, mp4, capturedAt="2026-11-04T01:00:00Z").json()["data"]
     assert duplicate["videoId"] == video["videoId"]
     assert duplicate["deduplicated"] is True
-    other = upload(client, mp4, "cam_02").json()["data"]
+    assert duplicate["capturedAt"] == video["capturedAt"]
+    other = upload(client, mp4 + b"extra").json()["data"]
     assert other["videoId"] != video["videoId"]
-    assert other["deduplicated"] is True
-    assert len(list((tmp_path / "uploads").glob("*.mp4"))) == 1
+    assert other["deduplicated"] is False
+    assert len(list((tmp_path / "uploads").glob("*.mp4"))) == 2
     assert not list((tmp_path / "uploads").glob(".upload_*"))
     assert len(client.get(API + "/videos").json()["data"]["items"]) == 2
     assert client.get(video["previewUrl"]).headers["content-type"] == "image/jpeg"
@@ -113,7 +120,7 @@ def test_upload_deduplication_and_resource_isolation(tmp_path, mp4):
     assert client.post(API + "/configurations", json=payload).status_code == 409
     payload["videoId"] = video["videoId"]
     payload["cameraId"] = "cam_02"
-    assert client.post(API + "/configurations", json=payload).status_code == 422
+    assert client.post(API + "/configurations", json=payload).status_code == 200
     payload.pop("videoId")
     assert client.post(API + "/configurations", json=payload).status_code == 409
     assert client.post(API + "/tasks", json={"inputType": "CAMERA_STREAM",
@@ -130,7 +137,7 @@ def test_history_single_slot_and_same_camera_realtime_coexist(tmp_path, mp4):
         task = first.json()["data"]["taskId"]
         wait_status(client, task, "RUNNING")
         assert start(client, video, config).status_code == 409
-        other = upload(client, mp4 + b"extra", camera="cam_02").json()["data"]["videoId"]
+        other = upload(client, mp4 + b"extra").json()["data"]["videoId"]
         other_config, _ = configure(client, other, camera="cam_02")
         assert start(client, other, other_config).status_code == 409
         _, png = cv2.imencode(".png", np.zeros((24, 32, 3), np.uint8))
@@ -198,7 +205,7 @@ def test_real_video_execution_and_json_restart(tmp_path, mp4):
 ])
 def test_invalid_upload_leaves_no_file(tmp_path, content, name, mime, status):
     client = TestClient(create_app(video_directory=tmp_path / "uploads"))
-    response = client.post(API + "/videos", data={"cameraId": "cam_01"},
+    response = client.post(API + "/videos",
                            files={"file": (name, content, mime)})
     assert response.status_code == status
     assert not list((tmp_path / "uploads").glob("*"))
@@ -210,7 +217,6 @@ def test_upload_limit_authentication_and_unknown_video(tmp_path, mp4, monkeypatc
     assert upload(client, mp4).status_code == 413
     assert not list((tmp_path / "uploads").glob("*"))
     assert upload(client, mp4, capturedAt="bad").status_code == 422
-    assert upload(client, mp4, camera=" ").status_code == 422
     assert client.get(API + "/videos/missing").status_code == 404
     secure = TestClient(create_app(bearer_token="secret", video_directory=tmp_path / "secure"))
     assert upload(secure, mp4).status_code == 401

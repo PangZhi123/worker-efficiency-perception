@@ -23,7 +23,7 @@ CREATE TABLE we_camera (
 
 CREATE TABLE we_video (
     video_id VARCHAR(64) PRIMARY KEY,
-    camera_id VARCHAR(64) NOT NULL,
+    camera_id VARCHAR(64) NULL,
     storage_path VARCHAR(1024) NOT NULL,
     width INT UNSIGNED NOT NULL,
     height INT UNSIGNED NOT NULL,
